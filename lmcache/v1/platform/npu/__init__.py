@@ -2,7 +2,7 @@
 """Ascend NPU platform helpers."""
 
 # First Party
-from lmcache.v1.platform.base_device_info import DeviceInfo
+from lmcache.v1.platform.base_device_spec import DeviceSpec
 from lmcache.v1.platform.base_pin_memory import PinMemoryBackend
 from lmcache.v1.platform.npu.pin_memory import NpuPinMemoryBackend
 
@@ -11,8 +11,8 @@ from lmcache.v1.platform.npu.pin_memory import NpuPinMemoryBackend
 # ---------------------------------------------------------------------------
 
 
-class NpuDeviceInfo(DeviceInfo):
-    """Ascend NPU device information for the detection registry.
+class NpuDeviceSpec(DeviceSpec):
+    """Ascend NPU device spec for the detection registry.
 
     The compiled ops backend (``lmcache_ascend.c_ops``) and NPU-specific
     transfer optimisation live in the external ``lmcache_ascend`` plugin; this
