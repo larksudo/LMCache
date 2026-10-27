@@ -7,6 +7,7 @@ from typing import Any, Callable, NoReturn, Protocol
 import enum
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -62,6 +63,16 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
+    # Admission coalescing (hold-K prototype, see
+    # docs/rfc_admission_coalescing.md): hold freshly-completed retrieves
+    # in get_finished() until K of them are ready, so their prefill tails
+    # land on one step boundary and the per-step token budget is filled.
+    # 0 disables the hold entirely (status-quo behavior, bit-identical).
+    admit_coalesce = 0
+    # Deadline (milliseconds) for the hold above, measured from the time
+    # the retrieve was SUBMITTED (not from when it became ready). When the
+    # oldest held retrieve crosses this deadline, everything is reported.
+    admit_coalesce_ms = 1200.0
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
@@ -1097,8 +1108,17 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
+            # Hold-K admission coalescing knobs (0 = off, bit-identical).
+            self._admit_coalesce_k = cfg[ExtraConfigDefault.admit_coalesce.name]
+            self._admit_coalesce_s = (
+                cfg[ExtraConfigDefault.admit_coalesce_ms.name] / 1000.0
+            )
         else:
             self._mp_transfer_mode = None
+            self._admit_coalesce_k = ExtraConfigDefault.admit_coalesce.value
+            self._admit_coalesce_s = (
+                ExtraConfigDefault.admit_coalesce_ms.value / 1000.0
+            )
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1124,6 +1144,9 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
+        # request_id -> submit timestamp (monotonic) for the hold-K
+        # admission-coalescing deadline in get_finished().
+        self._ret_submit_ts: dict[str, float] = {}
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
@@ -1483,6 +1506,10 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
+        # Hold-K admission coalescing anchors its deadline at SUBMIT time
+        # (see docs/rfc_admission_coalescing.md): the hold a request may
+        # absorb is bounded by wall time already spent waiting for it.
+        self._ret_submit_ts[request_id] = time.monotonic()
         self.retrieve_events[request_id] = event
 
     @_lmcache_nvtx_annotate
@@ -1596,6 +1623,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
+            self._ret_submit_ts.clear()
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1648,6 +1676,24 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
+        # Hold-K admission coalescing (prototype; see
+        # docs/rfc_admission_coalescing.md). Release is implicit when any
+        # condition stops holding: |ready| >= K, no sibling retrieve in
+        # flight, or the oldest ready request has waited admit_coalesce_ms
+        # since SUBMIT. Held ids stay in retrieve_futures and are
+        # re-evaluated on the next call, so nothing is ever lost.
+        if self._admit_coalesce_k > 1 and self.retrieve_futures:
+            inflight = set(self.retrieve_futures) - finished_retrieves
+            if (
+                0 < len(finished_retrieves) < self._admit_coalesce_k
+                and inflight
+            ):
+                oldest_submit = min(
+                    self._ret_submit_ts.get(r, 0.0) for r in finished_retrieves
+                )
+                if time.monotonic() - oldest_submit < self._admit_coalesce_s:
+                    finished_retrieves = set()
+
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
@@ -1655,6 +1701,7 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
+            self._ret_submit_ts.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
