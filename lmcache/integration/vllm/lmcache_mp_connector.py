@@ -673,6 +673,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_block_size=vllm_config.cache_config.block_size,
                 parallel_strategy=parallel_strategy,
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+                admit_coalesce_budget=(
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                ),
             )
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")

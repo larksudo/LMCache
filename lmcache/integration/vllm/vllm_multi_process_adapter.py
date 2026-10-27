@@ -63,22 +63,31 @@ class ExtraConfigDefault(enum.Enum):
     # Mirrors the ``LMCACHE_MP_TRANSFER_MODE`` env var; this extra_config
     # key wins when both are set.
     mp_transfer_mode = "auto"
-    # Admission coalescing (hold-K prototype, see
-    # docs/rfc_admission_coalescing.md): hold freshly-completed retrieves
-    # in get_finished() until K of them are ready, so their prefill tails
-    # land on one step boundary and the per-step token budget is filled.
-    # 0 disables the hold entirely (status-quo behavior, bit-identical).
-    admit_coalesce = 0
-    # Deadline (milliseconds) for the hold above, measured from the time
-    # the retrieve was SUBMITTED (not from when it became ready). When the
-    # oldest held retrieve crosses this deadline, everything is reported.
-    admit_coalesce_ms = 1200.0
+    # Hold completed retrieves briefly so that several prefill tails
+    # are admitted on the same step boundary and the per-step token
+    # budget is filled (see docs/admission_coalescing.md). Default off.
+    admit_coalesce = False
 
 
 # Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
 # entry point, which still passes these as positional/keyword args.
 DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
 DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
+
+# Hold deadline in seconds, measured from retrieve submission.
+_ADMIT_COALESCE_DEADLINE_S: float = 1.2
+# Fraction of the step budget that counts as a full step.
+_ADMIT_COALESCE_ALPHA: float = 0.85
+# Enable the sibling-ETA release condition.
+_ADMIT_COALESCE_ETA: bool = True
+# Fallback step budget in tokens; the connector supplies vLLM's real
+# max_num_batched_tokens, so this only applies to direct construction.
+_ADMIT_COALESCE_BUDGET_TOKENS: int = 8192
+# Runtime override for the switch: when this file exists, its content
+# ("true"/"false") overrides the startup config on the fly, so A/B arms
+# can flip the mechanism without restarting vLLM. Absent file = the
+# startup config governs (no behavior change for normal deployments).
+_ADMIT_COALESCE_OVERRIDE_FILE = "/tmp/lmcache_admit_coalesce"
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
 
@@ -1063,6 +1072,7 @@ class LMCacheMPWorkerAdapter:
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
+        admit_coalesce_budget: int = _ADMIT_COALESCE_BUDGET_TOKENS,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1108,17 +1118,19 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
-            # Hold-K admission coalescing knobs (0 = off, bit-identical).
-            self._admit_coalesce_k = cfg[ExtraConfigDefault.admit_coalesce.name]
-            self._admit_coalesce_s = (
-                cfg[ExtraConfigDefault.admit_coalesce_ms.name] / 1000.0
+            # Hold-K admission coalescing: one switch; K fixed at 2.
+            self._admit_coalesce_k = (
+                2 if cfg[ExtraConfigDefault.admit_coalesce.name] else 0
             )
         else:
             self._mp_transfer_mode = None
-            self._admit_coalesce_k = ExtraConfigDefault.admit_coalesce.value
-            self._admit_coalesce_s = (
-                ExtraConfigDefault.admit_coalesce_ms.value / 1000.0
+            self._admit_coalesce_k = (
+                2 if ExtraConfigDefault.admit_coalesce.value else 0
             )
+        self._admit_coalesce_s = _ADMIT_COALESCE_DEADLINE_S
+        self._admit_coalesce_alpha = _ADMIT_COALESCE_ALPHA
+        self._admit_coalesce_eta = _ADMIT_COALESCE_ETA
+        self._admit_coalesce_budget = admit_coalesce_budget
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -1144,9 +1156,17 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
-        # request_id -> submit timestamp (monotonic) for the hold-K
-        # admission-coalescing deadline in get_finished().
+        # request_id -> retrieve submission timestamp.
         self._ret_submit_ts: dict[str, float] = {}
+        # request_id -> prefill tail in tokens (prompt length minus cache
+        # hit), read from the op because new metadata fields do not
+        # survive SchedulerOutput serialization.
+        self._ret_tail: dict[str, int] = {}
+        # EWMA of retrieve durations (submission to report); None until
+        # the first observation.
+        self._ret_rt_ewma: float | None = None
+        # Cached (mtime, value) of the runtime override file.
+        self._ac_override: tuple[float, bool] | None = None
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
@@ -1506,10 +1526,8 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
-        # Hold-K admission coalescing anchors its deadline at SUBMIT time
-        # (see docs/rfc_admission_coalescing.md): the hold a request may
-        # absorb is bounded by wall time already spent waiting for it.
         self._ret_submit_ts[request_id] = time.monotonic()
+        self._ret_tail[request_id] = max(0, len(op.token_ids) - op.end)
         self.retrieve_events[request_id] = event
 
     @_lmcache_nvtx_annotate
@@ -1583,6 +1601,101 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def _admit_coalesce_enabled(self) -> bool:
+        """Whether the hold is enabled, honoring the runtime override file.
+
+        The file is re-read only when its mtime changes, so the per-step
+        cost is one stat. When it is absent the startup config governs.
+        """
+        if self._admit_coalesce_k <= 1:
+            return False
+        try:
+            mtime = os.stat(_ADMIT_COALESCE_OVERRIDE_FILE).st_mtime
+        except OSError:
+            return True
+        if self._ac_override is None or self._ac_override[0] != mtime:
+            try:
+                with open(_ADMIT_COALESCE_OVERRIDE_FILE) as f:
+                    value = f.read().strip().lower() in ("1", "true", "on", "yes")
+            except OSError:
+                return True
+            self._ac_override = (mtime, value)
+            logger.info(
+                "admit_coalesce: runtime override -> %s", value
+            )
+        return self._ac_override[1]
+
+    def _admit_coalesce_hold(
+        self, finished_retrieves: set[str]
+    ) -> set[str]:
+        """Hold completed retrieves for one step so that several prefill
+        tails are admitted on the same step boundary.
+
+        Returns an empty set to hold the ready retrieves for one more
+        step (they stay in ``retrieve_futures`` and are re-evaluated on
+        the next call), or the input unchanged to report them now.
+        """
+        if not self._admit_coalesce_enabled() or not self.retrieve_futures:
+            return finished_retrieves
+        if not 0 < len(finished_retrieves) < self._admit_coalesce_k:
+            return finished_retrieves
+        inflight = set(self.retrieve_futures) - finished_retrieves
+        if not inflight:
+            return finished_retrieves
+
+        # A ready request whose tail alone fills a step gains nothing
+        # from waiting, and if even all ready + in-flight tails together
+        # cannot fill a step, waiting cannot produce a full step either.
+        fill_floor = self._admit_coalesce_alpha * self._admit_coalesce_budget
+        tails = self._ret_tail
+        if any(tails.get(r, 0) >= fill_floor for r in finished_retrieves):
+            return finished_retrieves
+        cohort = finished_retrieves | inflight
+        if sum(tails.get(r, 0) for r in cohort) < fill_floor:
+            return finished_retrieves
+
+        now = time.monotonic()
+        oldest_submit = min(
+            self._ret_submit_ts.get(r, 0.0) for r in finished_retrieves
+        )
+        deadline_left = self._admit_coalesce_s - (now - oldest_submit)
+        if deadline_left <= 0:
+            return finished_retrieves
+
+        # Hold only while the earliest in-flight sibling is estimated to
+        # finish before the deadline: its remaining time is the typical
+        # retrieve duration minus how long it has already waited.
+        # Without duration observations, release instead of holding.
+        if self._admit_coalesce_eta:
+            if self._ret_rt_ewma is None:
+                return finished_retrieves
+            eta_min = min(
+                max(0.0, self._ret_rt_ewma - (now - self._ret_submit_ts.get(r, now)))
+                for r in inflight
+            )
+            if eta_min > deadline_left:
+                return finished_retrieves
+
+        return set()
+
+    def _note_retrieve_durations(self, reported: set[str]) -> None:
+        """Update the retrieve-duration EWMA (submission to report).
+
+        Only non-held requests are sampled, so hold time does not
+        inflate the estimate.
+        """
+        now = time.monotonic()
+        for request_id in reported:
+            t0 = self._ret_submit_ts.get(request_id)
+            if t0 is None:
+                continue
+            duration = now - t0
+            self._ret_rt_ewma = (
+                duration
+                if self._ret_rt_ewma is None
+                else 0.8 * self._ret_rt_ewma + 0.2 * duration
+            )
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -1624,6 +1737,7 @@ class LMCacheMPWorkerAdapter:
             self.store_events.clear()
             self.retrieve_events.clear()
             self._ret_submit_ts.clear()
+            self._ret_tail.clear()
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1676,23 +1790,9 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
-        # Hold-K admission coalescing (prototype; see
-        # docs/rfc_admission_coalescing.md). Release is implicit when any
-        # condition stops holding: |ready| >= K, no sibling retrieve in
-        # flight, or the oldest ready request has waited admit_coalesce_ms
-        # since SUBMIT. Held ids stay in retrieve_futures and are
-        # re-evaluated on the next call, so nothing is ever lost.
-        if self._admit_coalesce_k > 1 and self.retrieve_futures:
-            inflight = set(self.retrieve_futures) - finished_retrieves
-            if (
-                0 < len(finished_retrieves) < self._admit_coalesce_k
-                and inflight
-            ):
-                oldest_submit = min(
-                    self._ret_submit_ts.get(r, 0.0) for r in finished_retrieves
-                )
-                if time.monotonic() - oldest_submit < self._admit_coalesce_s:
-                    finished_retrieves = set()
+        # Hold-K admission coalescing (see _admit_coalesce_hold).
+        finished_retrieves = self._admit_coalesce_hold(finished_retrieves)
+        self._note_retrieve_durations(finished_retrieves)
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
@@ -1702,6 +1802,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
             self._ret_submit_ts.pop(request_id, None)
+            self._ret_tail.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
