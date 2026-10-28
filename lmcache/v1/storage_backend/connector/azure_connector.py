@@ -149,10 +149,10 @@ class AzureConnector(RemoteConnector):
             props = await blob.get_blob_properties()
             return props.size or 0
         except ResourceNotFoundError:
-            logger.debug(f"Blob not found: {key_str}")
+            logger.debug("Blob not found: %s", key_str)
             return 0
         except Exception as e:
-            logger.warning(f"Azure HEAD/properties error for {key_str}: {e}")
+            logger.warning("Azure HEAD/properties error for %s: %s", key_str, e)
             return 0
 
     # ------------------------------------------------------------------ #
@@ -201,7 +201,7 @@ class AzureConnector(RemoteConnector):
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Download the chunk for ``key`` into a freshly allocated MemoryObj.
 
-        The blob is streamed directly into the preallocated buffer (zero-copy).
+        The blob bytes are downloaded and copied into the preallocated buffer.
 
         Args:
             key: The cache engine key to fetch.
@@ -231,10 +231,13 @@ class AzureConnector(RemoteConnector):
 
         if obj_size != memory_obj.get_size():
             logger.error(
-                f"Size mismatch for {key_str}: Azure has {obj_size} bytes, "
-                f"but current config expects {memory_obj.get_size()} bytes. "
-                f"This usually means the data was stored with a different "
-                f"chunk_size or model configuration."
+                "Size mismatch for %s: Azure has %s bytes, "
+                "but current config expects %s bytes. "
+                "This usually means the data was stored with a different "
+                "chunk_size or model configuration.",
+                key_str,
+                obj_size,
+                memory_obj.get_size(),
             )
             memory_obj.ref_count_down()
             return None
@@ -242,11 +245,22 @@ class AzureConnector(RemoteConnector):
         try:
             blob = self.container_client.get_blob_client(self._blob_name(key_str))
             downloader = await blob.download_blob()
-            # Zero-copy: stream straight into the preallocated buffer.
-            await downloader.readinto(memory_obj.byte_array)
+            # Read the whole blob into bytes, then copy into the buffer.
+            data = await downloader.readall()
+            dst = memoryview(memory_obj.byte_array).cast("B")
+            if len(data) != len(dst):
+                logger.error(
+                    "Downloaded %s bytes for %s but the buffer is %s bytes; dropping.",
+                    len(data),
+                    key_str,
+                    len(dst),
+                )
+                memory_obj.ref_count_down()
+                return None
+            dst[:] = data
             return memory_obj
         except Exception as e:
-            logger.error(f"Failed to download {key_str} from Azure: {e}")
+            logger.error("Failed to download %s from Azure: %s", key_str, e)
             memory_obj.ref_count_down()
             return None
 
@@ -274,26 +288,29 @@ class AzureConnector(RemoteConnector):
 
         if memory_obj.get_physical_size() != self.part_size:
             logger.error(
-                f"Cannot upload {key_str}: chunk size "
-                f"{memory_obj.get_physical_size()} bytes does not match expected "
-                f"part size {self.part_size} bytes. "
-                f"Partial/unfull chunks are not supported."
+                "Cannot upload %s: chunk size "
+                "%s bytes does not match expected "
+                "part size %s bytes. "
+                "Partial/unfull chunks are not supported.",
+                key_str,
+                memory_obj.get_physical_size(),
+                self.part_size,
             )
             return
 
         try:
             blob = self.container_client.get_blob_client(self._blob_name(key_str))
-            # Pass the memoryview directly (zero-copy); bytes() would copy the
-            # whole chunk.
+            # upload_blob cannot consume a raw memoryview; it needs bytes.
+            data = bytes(memoryview(memory_obj.byte_array).cast("B"))
             await blob.upload_blob(
-                memory_obj.byte_array,
+                data,
                 overwrite=True,
-                length=memory_obj.get_physical_size(),
+                length=len(data),
             )
             self.object_size_cache[key_str] = memory_obj.get_physical_size()
-            logger.debug(f"Uploaded {key_str} to Azure successfully")
+            logger.debug("Uploaded %s to Azure successfully", key_str)
         except Exception as e:
-            logger.error(f"Failed to upload {key_str} to Azure: {e}")
+            logger.error("Failed to upload %s to Azure: %s", key_str, e)
 
     # ------------------------------------------------------------------ #
     # list / close

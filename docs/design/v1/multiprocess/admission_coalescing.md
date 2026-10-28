@@ -22,10 +22,6 @@ switch:
 "lmcache.mp.admit_coalesce": true
 ```
 
-For A/B testing the mechanism can also be flipped at runtime without
-restarting vLLM: writing `true`/`false` to `/tmp/lmcache_admit_coalesce`
-overrides the startup config (absent file = startup config governs).
-
 Everything else is derived automatically (see Parameters).
 
 ## Parameters
@@ -34,15 +30,15 @@ Everything else is derived automatically (see Parameters).
 |---|---|---|---|
 | switch | enable the mechanism | user config | false |
 | B | per-step token budget | vLLM `max_num_batched_tokens`, passed by the connector | — |
-| alpha | fraction of B that counts as a full step | module constant | 0.85 |
-| T | hold deadline, from retrieve submission | module constant | 1.2 s |
-| K | number of ready retrieves to coalesce | module constant | 2 |
+| alpha | fraction of B that counts as a full step | module constant | 0.75 |
+| T | hold deadline, from retrieve submission | module constant | 3.0 s |
+| K | number of ready retrieves to coalesce | module constant | 3 |
 | d | typical retrieve duration (submission to report) | runtime EWMA | learned |
 
 Per-request state: submission timestamp, prefill tail in tokens
-(`len(op.token_ids) - op.end`, read from the op because new metadata
-fields do not survive `SchedulerOutput` serialization), and the shared
-duration EWMA.
+(packed token count minus the cached range, read from the op because
+new metadata fields do not survive `SchedulerOutput` serialization),
+and the shared duration EWMA.
 
 ## Gate
 
@@ -56,7 +52,7 @@ on each get_finished() call (once per engine step):
         K or more ready                                  # coalesce target reached
         no inflight sibling                              # nothing to wait for
         any ready tail >= alpha * B                      # fills a step alone
-        sum(tails of ready + inflight) < alpha * B       # waiting cannot fill a step
+        sum(ready + inflight tails) < alpha * B          # cannot fill a step together
         now - oldest_ready_submit >= T                   # deadline expired
         d is unknown                                     # no duration estimate yet
         min over inflight of (d - waited) > T - (now - oldest_ready_submit)
@@ -73,10 +69,10 @@ after reporting: update the duration EWMA from each reported
 
 - **K reached / no sibling in flight** — with nothing left to wait for,
   holding is pure latency.
-- **A tail alone fills a step** — that request's admission already
-  produces a full step; delaying it cannot reduce the step count.
-- **All tails together cannot fill a step** — coalescing them still
-  leaves a mostly-empty step, so the wait does not buy a full step.
+- **A tail alone fills a step** — a sibling cannot join an already-full
+  step, so delaying the request cannot reduce the step count. Smaller
+  tails are coalesced regardless of fill: merging two partial tails
+  into one step still saves a whole step's fixed cost.
 - **Deadline** — bounds the added latency of any held request. It is
   measured from submission because that is the wall time the request
   has already invested.

@@ -23,7 +23,7 @@ import prometheus_client
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.usage_context import ContinuousUsageContext
+from lmcache.usage_telemetry import ContinuousUsageContext
 from lmcache.utils import thread_safe
 from lmcache.v1.metadata import LMCacheMetadata
 
@@ -1997,7 +1997,8 @@ class LMCacheStatsLogger:
             # Just enough time for the thread to finish its current iteration
             timeout = 5.0
             logger.info(
-                f"Waiting for stats logger thread to finish (timeout: {timeout}s)..."
+                "Waiting for stats logger thread to finish (timeout: %ss)...",
+                timeout,
             )
 
             try:
@@ -2005,10 +2006,11 @@ class LMCacheStatsLogger:
 
                 if self.thread.is_alive():
                     logger.warning(
-                        f"Stats logger thread did not terminate "
-                        f"within {timeout}s timeout. "
+                        "Stats logger thread did not terminate "
+                        "within %ss timeout. "
                         "Thread may be blocked in logging operations. "
-                        "Proceeding with shutdown anyway."
+                        "Proceeding with shutdown anyway.",
+                        timeout,
                     )
                 else:
                     logger.info("Stats logger thread terminated successfully")

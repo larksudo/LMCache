@@ -156,8 +156,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "blend_min_tokens": {"type": int, "default": 256, "env_converter": int},
     "blend_special_str": {"type": str, "default": " # # ", "env_converter": str},
-    "retrieve_locations": {"type": Optional[list[str]], "default": None},
-    "store_location": {"type": Optional[str], "default": None},
+    "retrieve_locations": {
+        "type": Optional[list[str]],
+        "default": None,
+        "env_converter": _to_str_list,
+    },
+    "store_location": {"type": Optional[str], "default": None, "env_converter": str},
     # P2P configurations
     "enable_p2p": {
         "type": bool,
@@ -368,7 +372,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "internal_api_server_host": {
         "type": str,
-        "default": "0.0.0.0",
+        "default": "127.0.0.1",
         "env_converter": str,
     },
     "extra_config": {
@@ -485,6 +489,14 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "type": Optional[list[str]],
         "default": None,
         "env_converter": _to_str_list,
+    },
+    # /run_script executes caller-supplied Python in-process (the restricted
+    # builtins are not a security boundary), so it is disabled unless the
+    # operator explicitly opts in.
+    "run_script_api_enabled": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
     },
     # Lazy memory allocator configurations
     "enable_lazy_memory_allocator": {
@@ -1031,7 +1043,10 @@ def _update_config_from_env(self):
                 self._user_set_keys.add(name)
             except (ValueError, json.JSONDecodeError) as e:
                 logger.warning(
-                    f"Failed to parse {get_env_name(name)}={raw_value!r}: {e}"
+                    "Failed to parse %s=%r: %s",
+                    get_env_name(name),
+                    raw_value,
+                    e,
                 )
                 # Keep existing value if conversion fails
     self.validate()

@@ -5,21 +5,14 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Mapping
-from concurrent.futures import Future
-from typing import Any, Callable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.storage_backend.abstract_backend import (
-    AllocatorBackendInterface,
-    StoragePluginInterface,
-)
-from lmcache.v1.storage_backend.raw_block import (
+from lmcache.v1.distributed.l2_adapters.raw_block import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RawBlockCore,
     RawBlockCoreConfig,
@@ -30,6 +23,18 @@ from lmcache.v1.storage_backend.raw_block import (
     round_up,
     validate_raw_block_io_options,
 )
+from lmcache.v1.storage_backend.abstract_backend import (
+    AllocatorBackendInterface,
+    StoragePluginInterface,
+)
+
+if TYPE_CHECKING:
+    # Standard
+    from concurrent.futures import Future
+
+    # First Party
+    from lmcache.utils import CacheEngineKey
+    from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
 
@@ -371,6 +376,34 @@ class RustRawBlockBackend(StoragePluginInterface):
                 self._pinned_keys.discard(spec.encoded)
         return removed
 
+    def batched_remove(
+        self,
+        keys: list[CacheEngineKey],
+        force: bool = True,
+    ) -> int:
+        """Remove multiple keys in a single locked batch.
+
+        Acquires ``_pin_lock`` once and issues one ``_core.delete_many`` call
+        for the whole batch, instead of locking per key.
+
+        Args:
+            keys: Cache keys to remove.
+            force: Passed through to ``RawBlockCore.delete_many``. When false,
+                locked entries are preserved.
+
+        Returns:
+            Number of keys that were actually removed.
+        """
+        if not keys:
+            return 0
+        encoded_keys = [encode_legacy_key(key).encoded for key in keys]
+        with self._pin_lock:
+            results = self._core.delete_many(encoded_keys, force=force)
+            for encoded_key, removed in zip(encoded_keys, results, strict=True):
+                if removed:
+                    self._pinned_keys.discard(encoded_key)
+        return sum(results)
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -378,10 +411,31 @@ class RustRawBlockBackend(StoragePluginInterface):
         transfer_spec: Any = None,  # noqa: ARG002
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> list[Future] | None:
+        """Schedule writes unless the native io_uring worker has failed.
+
+        Args:
+            keys: Cache keys corresponding to ``objs``.
+            objs: Memory objects retained until their writes finish.
+            transfer_spec: Unused transfer metadata.
+            on_complete_callback: Callback for each successfully stored key.
+
+        Returns:
+            Scheduled futures, or None when no writes are needed or the native
+            worker has failed. Worker failure skips writes without retaining
+            objects or raising to the caller.
+
+        Raises:
+            RuntimeError: If no event loop exists.
+        """
         del transfer_spec
         loop = self.loop
         if loop is None:
             raise RuntimeError("RustRawBlockBackend requires an asyncio event loop")
+        try:
+            self._core.raise_if_failed()
+        except RuntimeError:
+            logger.exception("Skipping raw-block store after native worker failure")
+            return None
 
         pending: list[tuple[CacheEngineKey, RawBlockKeySpec, MemoryObj]] = []
         for key, obj in zip(keys, objs, strict=False):
@@ -573,7 +627,6 @@ class RustRawBlockBackend(StoragePluginInterface):
             load_results = self._core.load_many_into(
                 [spec.encoded for spec in load_specs],
                 allocated,
-                raise_on_error=True,
             )
             loaded_count = 0
             for ok in load_results:
@@ -612,7 +665,6 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         Raises:
             RuntimeError: If the local CPU allocator backend is unavailable.
-            Exception: Propagates raw-device load failures from the core.
         """
         if not keys:
             return []
@@ -661,7 +713,6 @@ class RustRawBlockBackend(StoragePluginInterface):
 
         Raises:
             RuntimeError: If the local CPU allocator backend is unavailable.
-            Exception: Propagates raw-device load failures from the core.
         """
         del lookup_id, transfer_spec
         return await asyncio.to_thread(self._batched_get_prefix, keys)

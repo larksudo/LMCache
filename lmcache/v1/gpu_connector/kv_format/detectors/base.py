@@ -14,7 +14,7 @@ from typing import ClassVar, Optional
 # First Party
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.kv_format.types import DiscoverableKVCache, LayoutHints
-import lmcache.c_ops as lmc_ops
+import lmcache.lmcache_native as lmcache_native
 
 
 def measure_list_depth_until_tensor(
@@ -27,9 +27,9 @@ def measure_list_depth_until_tensor(
     """
     list_depth = 0
     node = kv_caches
-    while isinstance(node, (list, tuple)):
+    while isinstance(node, list):
         if not node:
-            raise ValueError("encountered an empty kv_caches list or tuple")
+            raise ValueError("encountered an empty kv_caches list")
         list_depth += 1
         node = node[0]
     return list_depth, node.ndim, node
@@ -42,8 +42,10 @@ class EngineDetector(ABC):
 
     @abstractmethod
     def discover(
-        self, kv_caches: DiscoverableKVCache, layout_hints: LayoutHints
-    ) -> "tuple[Optional[lmc_ops.EngineKVFormat], DiscoverableKVCache]":
+        self,
+        kv_caches: DiscoverableKVCache,
+        layout_hints: LayoutHints,
+    ) -> "tuple[Optional[lmcache_native.EngineKVFormat], DiscoverableKVCache]":
         """Return ``(format, canonical_kv_caches)``, or ``(None, kv_caches)``.
 
         Reshapes this engine's raw layout into the canonical structure the specs

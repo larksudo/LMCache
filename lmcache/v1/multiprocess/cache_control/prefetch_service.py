@@ -12,11 +12,14 @@ status codes. It owns the node's :class:`WarmPrefetchJobs` table.
 from typing import Any
 
 # First Party
-from lmcache.v1.distributed.tiers import Tier
-from lmcache.v1.multiprocess.cache_control.errors import InvalidRequest, NotFound
+from lmcache.v1.distributed.api import Tier
+from lmcache.v1.multiprocess.cache_control.errors import (
+    InvalidRequest,
+    NotFound,
+    Unavailable,
+)
 from lmcache.v1.multiprocess.cache_control.key_resolver import (
-    MAX_TOKEN_IDS,
-    resolve_l1_keys,
+    resolve_grouped_object_keys,
 )
 from lmcache.v1.multiprocess.warm_prefetch import (
     COMPLETED,
@@ -58,7 +61,7 @@ class PrefetchService:
         Raises:
             InvalidRequest: unsupported direction, token cap exceeded, or an
                 invalid key field.
-            Unavailable: no layout registered for the model (via the resolver).
+            Unavailable: no layout registered for the model (not on this node).
         """
         if source_tier != _SOURCE_TIER or target_tier != _TARGET_TIER:
             raise InvalidRequest(
@@ -66,19 +69,41 @@ class PrefetchService:
                 f"{target_tier.value!r}; only {_SOURCE_TIER.value!r}->"
                 f"{_TARGET_TIER.value!r}"
             )
-        if len(token_ids) > MAX_TOKEN_IDS:
-            raise InvalidRequest(
-                f"too many token_ids in a single request "
-                f"(limit={MAX_TOKEN_IDS}, got={len(token_ids)})"
-            )
-        obj_keys, chunks, layout_desc = resolve_l1_keys(
-            self._engine, model_name, world_size, token_ids, cache_salt
+        ctx = self._engine.context
+        registry = ctx.layout_desc_registry
+        # Every object group the model registered, each with its own layout
+        # and attention window -- the same rows the lookup path submits. One
+        # layout for group 0 would warm a fraction of each chunk under
+        # --separate-object-groups and report success.
+        unregistered = Unavailable(
+            f"no layout registered for model_name={model_name!r} "
+            f"world_size={world_size}; the model has not allocated "
+            f"KV cache on this node yet"
         )
+        group_layout_descs = registry.find_group_layout_descs(model_name, world_size)
+        if not group_layout_descs:
+            raise unregistered
+        try:
+            attn_desc = registry.find_attn_desc(model_name, world_size)
+        except ValueError:
+            # Unregistered between the two reads: the same answer, not a
+            # malformed request.
+            raise unregistered from None
+        try:
+            key_groups, chunks = resolve_grouped_object_keys(
+                ctx.token_hasher,
+                model_name,
+                world_size,
+                token_ids,
+                cache_salt,
+                group_layout_descs,
+                attn_desc,
+            )
+        except ValueError as exc:
+            raise InvalidRequest(str(exc)) from None
         if not chunks:
             return {"chunks": 0, "status": "noop"}
-        request_id = self._jobs.submit(
-            self._engine.storage_manager, obj_keys, layout_desc
-        )
+        request_id = self._jobs.submit(self._engine.storage_manager, key_groups)
         return {"request_id": request_id, "chunks": chunks, "status": "submitted"}
 
     def status(self, request_id: str) -> dict[str, object]:

@@ -24,6 +24,7 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.inprocess.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
@@ -32,7 +33,6 @@ from lmcache.utils import (
     start_loop_in_thread_with_exceptions,
 )
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
@@ -47,8 +47,8 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.cache_controller.worker import LMCacheWorker
-    from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
+    from lmcache.inprocess.v1.cache_controller.worker import LMCacheWorker
+    from lmcache.inprocess.v1.lookup_client.lmcache_async_lookup_client import (
         LMCacheAsyncLookupServer,
     )
 
@@ -84,6 +84,7 @@ def allocate_and_copy_objects(
           that has been successfully allocated
         - list of the memory objects that has been successfully allocated
     """
+    allocated_keys = []
     allocated_objects = []
     for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
         if allocator_backend.contains(key):
@@ -111,11 +112,12 @@ def allocate_and_copy_objects(
 
         with torch_dev.stream(stream):
             memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
+        allocated_keys.append(key)
         allocated_objects.append(memory_obj)
 
     if stream is not None:
         stream.synchronize()
-    return keys[: len(allocated_objects)], allocated_objects
+    return allocated_keys, allocated_objects
 
 
 class WeightedSemaphore:
@@ -407,30 +409,32 @@ class StorageManager:
             memory_objs,
         )
 
-        for backend_name, backend in self.storage_backends.items():
-            if location and backend_name != location:
-                continue
-            # Skip bypassed backends
-            with self._bypass_lock:
-                if backend_name in self._bypassed_backends:
+        try:
+            for backend_name, backend in self.storage_backends.items():
+                if location and backend_name != location:
                     continue
+                # Skip bypassed backends
+                with self._bypass_lock:
+                    if backend_name in self._bypassed_backends:
+                        continue
 
-            allocator_backend = backend.get_allocator_backend()
-            cname = get_backend_cname(allocator_backend)
-            if cname not in obj_dict:
-                new_keys, new_objs = allocate_and_copy_objects(
-                    allocator_backend, keys, memory_objs, self.internal_copy_stream
-                )
-                obj_dict[cname] = (new_keys, new_objs)
+                allocator_backend = backend.get_allocator_backend()
+                cname = get_backend_cname(allocator_backend)
+                if cname not in obj_dict:
+                    new_keys, new_objs = allocate_and_copy_objects(
+                        allocator_backend, keys, memory_objs, self.internal_copy_stream
+                    )
+                    obj_dict[cname] = (new_keys, new_objs)
 
-            # NOTE: the handling of exists_in_put_tasks
-            # is done in the backend
-            ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
-
-        for cname, (ks, objs) in obj_dict.items():
-            for memory_obj in objs:
-                memory_obj.ref_count_down()
+                # NOTE: the handling of exists_in_put_tasks
+                # is done in the backend
+                ks, objs = obj_dict[cname]
+                backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+        finally:
+            # Release the references this call owns even if a backend raised.
+            for cname, (ks, objs) in obj_dict.items():
+                for memory_obj in objs:
+                    memory_obj.ref_count_down()
 
     def get(
         self,

@@ -11,18 +11,20 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
+from lmcache.inprocess.v1.cache_controller.message import OpType
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
-from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
+from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
+    PagedCpuGpuMemoryAllocator,
+)
 from lmcache.v1.memory_management import (
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
-    MixedMemoryAllocator,
-    PagedCpuGpuMemoryAllocator,
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
@@ -32,7 +34,7 @@ from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
 if TYPE_CHECKING:
     # First Party
-    from lmcache.v1.cache_controller.worker import LMCacheWorker
+    from lmcache.inprocess.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
 
@@ -270,12 +272,31 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return True
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        """
+        Remove a memory object from the hot cache.
+
+        A forced remove also releases any lookup pins the object still holds.
+        The lookup ledger tracks keys, so once the key is dropped no later
+        ``unpin(key)`` can reach the object. An internal eviction
+        (``force=False``) keeps the pins: pinned objects are filtered out by
+        ``can_evict`` before they reach this path.
+
+        :param CacheEngineKey key: The key of the MemoryObj.
+        :param bool force: Whether it is a forced remove from the external.
+
+        :return: a bool indicates whether remove is successful.
+        """
         lock_context = self.cpu_lock if force else nullcontext()
         with lock_context:
             if key not in self.hot_cache:
                 return False
 
             memory_obj = self.hot_cache.pop(key)
+            if force:
+                # Forced removal abandons the entry, so no later key-based
+                # unpin can reach it. Release the lookup pins it still holds.
+                while memory_obj.is_pinned:
+                    memory_obj.unpin()
             memory_obj.ref_count_down()
 
             if force:
@@ -614,8 +635,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         rust_block_align = int(extra.get("rust_raw_block.block_align", 4096))
         if not self._is_power_of_two(rust_block_align):
             raise ValueError(
-                "extra_config['rust_raw_block.block_align'] must be a positive "
-                "power of two when O_DIRECT or io_uring alignment is enabled"
+                "extra_config['rust_raw_block.block_align'] must be a power "
+                "of two when O_DIRECT or io_uring alignment is enabled"
             )
         return rust_block_align
 
@@ -930,8 +951,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return list(self.hot_cache.keys())
 
     def clear(self) -> int:
-        """
-        counts the number of memory objects removed
+        """Remove every evictable entry from the hot cache.
+
+        Entries that are pinned or still referenced by a reader are kept.
+
+        Returns:
+            The number of tokens removed. Returns 0 when the hot cache is
+            disabled (``local_cpu`` is False).
         """
         if not self.use_hot:
             return 0

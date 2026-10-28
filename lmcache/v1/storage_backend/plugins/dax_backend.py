@@ -5,27 +5,33 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, cast
 import asyncio
 import ctypes
 import os
 import threading
 
-# Third Party
-import torch
-
 # First Party
+from lmcache import device_ops
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.distributed.l2_adapters.dax.core import DaxCore
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
-from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StoragePluginInterface
-from lmcache.v1.storage_backend.dax.core import DaxCore
-from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-import lmcache.c_ops as lmc_ops
+
+if TYPE_CHECKING:
+    # Standard
+    from concurrent.futures import Future
+
+    # Third Party
+    import torch
+
+    # First Party
+    from lmcache.v1.config import LMCacheEngineConfig
+    from lmcache.v1.metadata import LMCacheMetadata
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
 
@@ -143,6 +149,13 @@ class DaxBackend(StoragePluginInterface):
         if self.max_dax_size <= 0:
             raise ValueError("extra_config['dax.max_dax_size'] must be > 0")
 
+        offset_gb = extra.get("dax.offset_gb", 0)
+        if isinstance(offset_gb, bool) or not isinstance(offset_gb, (int, float)):
+            raise ValueError("extra_config['dax.offset_gb'] must be a number")
+        if offset_gb < 0:
+            raise ValueError("extra_config['dax.offset_gb'] must be >= 0")
+        self.offset_gb = float(offset_gb)
+
         if self.local_cpu_backend is None:
             raise ValueError("DaxBackend requires local_cpu_backend")
 
@@ -163,6 +176,7 @@ class DaxBackend(StoragePluginInterface):
             device_path=self.device_path,
             max_dax_size_bytes=int(self.max_dax_size * 1024**3),
             slot_bytes=max(1, full_chunk_size),
+            offset_bytes=int(self.offset_gb * 1024**3),
         )
         self.slot_bytes = self._core.slot_bytes
         self._arena_bytes = self._core.arena_bytes
@@ -205,7 +219,7 @@ class DaxBackend(StoragePluginInterface):
                 )
 
             self._retrieve_staging_slab_ptr = int(
-                lmc_ops.alloc_pinned_ptr(self._retrieve_staging_slab_bytes, 0)
+                device_ops.alloc_pinned_ptr(self._retrieve_staging_slab_bytes, 0)
             )
             self._restore_executor = ThreadPoolExecutor(
                 max_workers=self._restore_workers,
@@ -643,7 +657,7 @@ class DaxBackend(StoragePluginInterface):
 
         if self._retrieve_staging_slab_ptr:
             try:
-                lmc_ops.free_pinned_ptr(self._retrieve_staging_slab_ptr)
+                device_ops.free_pinned_ptr(self._retrieve_staging_slab_ptr)
             except Exception as exc:
                 logger.warning("Failed to free DAX retrieve slab: %s", exc)
 
@@ -685,8 +699,8 @@ class DaxBackend(StoragePluginInterface):
     ) -> None:
         if not src_ptrs:
             return
-        if hasattr(lmc_ops, "batched_memcpy"):
-            lmc_ops.batched_memcpy(list(src_ptrs), list(dst_ptrs), list(sizes))
+        if hasattr(device_ops, "batched_memcpy"):
+            device_ops.batched_memcpy(list(src_ptrs), list(dst_ptrs), list(sizes))
             return
 
         for src_ptr, dst_ptr, size in zip(src_ptrs, dst_ptrs, sizes, strict=True):

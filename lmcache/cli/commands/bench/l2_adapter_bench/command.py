@@ -79,6 +79,18 @@ def add_l2_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--l1-use-hugepages",
+        dest="l1_use_hugepages",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allocate the benchmark L1 buffer from the pre-allocated 2 MiB "
+            "hugepage pool instead of regular pinned memory. Requires "
+            "pre-allocated hugepages (sysctl vm.nr_hugepages). Default is "
+            "False."
+        ),
+    )
+    parser.add_argument(
         "--rounds",
         type=int,
         default=1,
@@ -133,13 +145,13 @@ def add_l2_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--flamegraph-mode",
-        choices=["on-cpu", "off-cpu"],
         default="on-cpu",
+        metavar="MODE[,MODE...]",
         help=(
-            "Flame-graph mode if enabled flame graph profiling. 'on-cpu' (perf "
-            "record) shows where CPU time goes; 'off-cpu' (perf off-CPU "
-            "via offcputime-bpfcc) shows time blocked on I/O / locks and "
-            "is best for I/O-bound adapters. Default: on-cpu."
+            "What to sample when profiling is on (default: on-cpu). Pass "
+            "several comma-separated to profile one benchmark run per mode. "
+            "Modes: on-cpu, off-cpu, wakeup, offwake (perf/bcc), wall, gil "
+            "(py-spy). See the 'lmcache tool flamegraph' docs for detail."
         ),
     )
     parser.add_argument(
@@ -152,13 +164,14 @@ def add_l2_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--flamegraph-dir",
+        "--flamegraph-scripts-dir",
         default="",
         metavar="DIR",
         help=(
             "Directory with the FlameGraph scripts (flamegraph.pl, "
-            "stackcollapse-perf.pl). Default: $FLAMEGRAPH_DIR or "
-            "~/FlameGraph, else auto-cloned into a temp directory."
+            "stackcollapse-perf.pl); default ~/FlameGraph (cloned there on "
+            "first use). Unused by --flamegraph-mode wall / gil, which "
+            "render their own SVG."
         ),
     )
 
@@ -186,17 +199,18 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
         make_object_keys,
         verify_round_trip,
     )
-    from lmcache.cli.commands.bench.l2_adapter_bench.profiling import (
+    from lmcache.cli.commands.bench.l2_adapter_bench.runner import (
+        bench_load,
+        bench_lookup,
+        bench_store,
+    )
+    from lmcache.cli.profiling import (
+        PY_SPY_MODES,
         FlameProfiler,
         ProfileError,
         check_profiling_deps,
         default_output_path,
         resolve_flamegraph_dir,
-    )
-    from lmcache.cli.commands.bench.l2_adapter_bench.runner import (
-        bench_load,
-        bench_lookup,
-        bench_store,
     )
     from lmcache.v1.distributed.l2_adapters import create_l2_adapter
     from lmcache.v1.distributed.l2_adapters.config import (
@@ -267,7 +281,13 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
 
     # Backing L1 memory buffer for adapters that need an L1 desc.
     # Sized for one in-flight wave of store + load buffers.
-    l1_buffer = make_aligned_tensor(2 * keys_per_round * data_size, l1_align_bytes)
+    use_hugepages = bool(getattr(args, "l1_use_hugepages", False))
+    l1_buffer_size = 2 * keys_per_round * data_size
+    l1_buffer = make_aligned_tensor(
+        l1_buffer_size,
+        l1_align_bytes,
+        use_hugepages=use_hugepages,
+    )
     l1_memory_desc = create_l1_memory_desc(l1_buffer, align_bytes=l1_align_bytes)
 
     # Resolve and validate the flame-graph toolchain up front, before any
@@ -281,7 +301,12 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
     if flamegraph_on:
         try:
             check_profiling_deps(args.flamegraph_mode)
-            flamegraph_dir = resolve_flamegraph_dir(args.flamegraph_dir, log)
+            # py-spy renders its own SVG; only the perf/bcc modes need
+            # the FlameGraph scripts, so do not clone them otherwise.
+            if args.flamegraph_mode not in PY_SPY_MODES:
+                flamegraph_dir = resolve_flamegraph_dir(
+                    args.flamegraph_scripts_dir, log
+                )
         except ProfileError as e:
             print(
                 "Error: --flamegraph on was requested but the profiling "
@@ -557,6 +582,15 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
             adapter.close()
         except Exception as e:
             print(f"[Cleanup] adapter.close() failed: {e}", file=sys.stderr)
+        # Release the hugepage-backed L1 buffer explicitly. ``make_aligned_tensor``
+        # builds it from a raw pointer via ``torch.frombuffer`` (which does not
+        # own the memory), so dropping the tensor alone would not return the
+        # 2 MiB hugepages to the pool until the process exits.
+        if use_hugepages:
+            # First Party
+            from lmcache.v1.memory_management import _free_cpu_memory
+
+            _free_cpu_memory(l1_buffer, l1_buffer_size, use_hugepages=True)
         log("[Cleanup] Done.")
 
     if failed:
@@ -632,7 +666,8 @@ def _emit_l2_adapter_metrics(
         section_id = f"op_{idx}"
         section = metrics.add_section(section_id, r.operation)
         section.add("operation", "Operation", r.operation)
-        section.add("rounds", "Rounds", len(r.round_durations))
+        section.add("rounds", "Rounds", r.attempted_rounds)
+        section.add("rounds_timed_out", "Rounds timed out", r.timed_out_rounds)
         section.add("keys_per_round", "Keys / round", r.keys_per_round)
         section.add("total_keys", "Total keys", r.total_keys)
         section.add("total_success", "Total success", r.total_success)

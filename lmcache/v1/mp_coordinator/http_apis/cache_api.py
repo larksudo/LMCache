@@ -7,8 +7,9 @@ Warm-prefetch dispatch to a named MP server, thin over the
 ``404`` for an unknown ``instance_id`` and ``502`` when an MP server is
 unreachable or rejects a proxied call.
 
-Quota writes, combined quota+usage status, and usage-event ingestion are
-accounting concerns and live in the ``/quota`` group (:mod:`quota_api`).
+Quota writes, combined quota+usage status, pins and delete act on the eviction
+controller's state, so that controller brings them itself
+(:mod:`lmcache.v1.mp_coordinator.controllers.eviction_http_api`).
 """
 
 # Third Party
@@ -17,17 +18,16 @@ from fastapi.responses import JSONResponse
 import httpx
 
 # First Party
+from lmcache.v1.mp_coordinator.controllers.prefetch_manager import PrefetchManager
 from lmcache.v1.mp_coordinator.http_apis.dependencies import (
     get_context,
     get_outbound_client,
 )
 from lmcache.v1.mp_coordinator.schemas import (
-    PinRequest,
-    PinResponse,
     PrefetchRequest,
     PrefetchResponse,
 )
-from lmcache.v1.mp_coordinator.utils.cache_utils import resolve_object_keys
+from lmcache.v1.mp_coordinator.views.instance_registry import InstanceRegistry
 
 router = APIRouter()
 
@@ -56,15 +56,17 @@ async def request_prefetch(body: PrefetchRequest, request: Request) -> PrefetchR
             target server is unreachable or rejects the submit.
     """
     ctx = get_context(request)
-    target = ctx.registry.get(body.instance_id)
+    prefetch = ctx.controllers.get(PrefetchManager)
+    target = ctx.views.get(InstanceRegistry).get(body.instance_id)
     if target is None:
+        prefetch.record_unknown_server()
         raise HTTPException(
             status_code=404,
             detail=f"no MP server registered with instance_id={body.instance_id!r}",
         )
 
     try:
-        result = await ctx.prefetch_manager.submit_prefetch(
+        result = await prefetch.submit_prefetch(
             target=target,
             http_client=get_outbound_client(request),
             model_name=body.model_name,
@@ -109,7 +111,8 @@ async def get_prefetch_status(
             target server is unreachable.
     """
     ctx = get_context(request)
-    target = ctx.registry.get(instance_id)
+    prefetch = ctx.controllers.get(PrefetchManager)
+    target = ctx.views.get(InstanceRegistry).get(instance_id)
     if target is None:
         raise HTTPException(
             status_code=404,
@@ -117,7 +120,7 @@ async def get_prefetch_status(
         )
 
     try:
-        code, payload = await ctx.prefetch_manager.get_status(
+        code, payload = await prefetch.get_status(
             target=target,
             http_client=get_outbound_client(request),
             request_id=request_id,
@@ -129,79 +132,3 @@ async def get_prefetch_status(
         ) from None
 
     return JSONResponse(status_code=code, content=payload)
-
-
-# -- Pin / unpin (L2 eviction protection) ------------------------------------
-
-
-@router.post("/cache/pins")
-async def request_pin(body: PinRequest, request: Request) -> PinResponse:
-    """Pin a token sequence's keys in the L2 eviction plan.
-
-    The coordinator resolves the token sequence to its object keys locally and
-    records them so they are excluded from its L2 eviction plan (fleet-wide,
-    per ``cache_salt``). No MP-server round-trip.
-
-    Args:
-        body: model/world_size, token_ids, cache_salt.
-
-    Returns:
-        ``PinResponse`` with ``requested`` chunks and ``affected`` L2 keys pinned.
-
-    Raises:
-        HTTPException: 400 if the token cap is exceeded or a key field is invalid.
-    """
-    ctx = get_context(request)
-    try:
-        resolved, chunks = resolve_object_keys(
-            ctx.token_hasher,
-            body.model_name,
-            body.world_size,
-            body.token_ids,
-            body.cache_salt,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-
-    ctx.eviction_manager.pin(resolved)
-    return PinResponse(
-        requested=chunks,
-        affected=len(resolved),
-        status="pinned",
-    )
-
-
-@router.delete("/cache/pins")
-async def request_unpin(body: PinRequest, request: Request) -> PinResponse:
-    """Unpin a token sequence's keys from the L2 eviction plan.
-
-    Symmetric with pin: resolves the keys locally and releases them, making them
-    eligible for L2 eviction again.
-
-    Args:
-        body: model/world_size, token_ids, cache_salt.
-
-    Returns:
-        ``PinResponse`` with ``requested`` chunks and ``affected`` L2 keys unpinned.
-
-    Raises:
-        HTTPException: 400 if the token cap is exceeded or a key field is invalid.
-    """
-    ctx = get_context(request)
-    try:
-        resolved, chunks = resolve_object_keys(
-            ctx.token_hasher,
-            body.model_name,
-            body.world_size,
-            body.token_ids,
-            body.cache_salt,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-
-    ctx.eviction_manager.unpin(resolved)
-    return PinResponse(
-        requested=chunks,
-        affected=len(resolved),
-        status="unpinned",
-    )
