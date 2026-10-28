@@ -19,6 +19,10 @@ import zmq
 # First Party
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
+from lmcache.integration.vllm.admission_coalescing import (
+    DEFAULT_BUDGET_TOKENS,
+    AdmissionCoalescer,
+)
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.mp_lookup_state import LookupState
 from lmcache.integration.vllm.mp_server_launcher import (
@@ -43,10 +47,14 @@ from lmcache.v1.multiprocess.custom_types import (
     KVEventBatch,
     KVEventRecord,
 )
-from lmcache.v1.multiprocess.futures import MessagingFuture, MessagingStream
+from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
     EngineGroupInfo,
     expand_engine_block_ids,
+)
+from lmcache.v1.multiprocess.kv_event_subscriber import (
+    KVEventStreamClosed,
+    MPKVEventSubscriber,
 )
 from lmcache.v1.multiprocess.token_codec import (
     TOKEN_STRIDE,
@@ -98,9 +106,6 @@ _KV_EVENT_RESYNCS = Counter(
     "server's cache-event log could not be followed exactly.",
     ["model_name", "worker_id", "reason"],
 )
-# Maximum records in each pushed batch.
-_KV_EVENT_BATCH_SIZE = 1024
-_KV_EVENT_RECONNECT_DELAY = 1.0
 
 
 class ExtraConfigDefault(enum.Enum):
@@ -144,7 +149,7 @@ class ExtraConfigDefault(enum.Enum):
     mp_transfer_mode = "auto"
     # Hold completed retrieves briefly so that several prefill tails
     # are admitted on the same step boundary and the per-step token
-    # budget is filled (see docs/admission_coalescing.md). Default off.
+    # budget is filled (see docs/design/v1/multiprocess/admission_coalescing.md). Default off.
     admit_coalesce = False
     # Whether IPC mechanisms must work across isolated containers (no
     # shared host IPC namespace or /dev/shm); see
@@ -165,20 +170,6 @@ class ExtraConfigDefault(enum.Enum):
 # positional/keyword args.
 DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.default
 
-# Hold deadline in seconds, measured from retrieve submission.
-_ADMIT_COALESCE_DEADLINE_S: float = 1.2
-# Fraction of the step budget that counts as a full step.
-_ADMIT_COALESCE_ALPHA: float = 0.85
-# Enable the sibling-ETA release condition.
-_ADMIT_COALESCE_ETA: bool = True
-# Fallback step budget in tokens; the connector supplies vLLM's real
-# max_num_batched_tokens, so this only applies to direct construction.
-_ADMIT_COALESCE_BUDGET_TOKENS: int = 8192
-# Runtime override for the switch: when this file exists, its content
-# ("true"/"false") overrides the startup config on the fly, so A/B arms
-# can flip the mechanism without restarting vLLM. Absent file = the
-# startup config governs (no behavior change for normal deployments).
-_ADMIT_COALESCE_OVERRIDE_FILE = "/tmp/lmcache_admit_coalesce"
 DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.default
 
 _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
@@ -1268,7 +1259,7 @@ class LMCacheMPWorkerAdapter:
         extra_config: dict[str, Any] | None = None,
         enable_kv_events: bool = False,
         required_chunk_alignment: int | None = None,
-        admit_coalesce_budget: int = _ADMIT_COALESCE_BUDGET_TOKENS,
+        admit_coalesce_budget: int = DEFAULT_BUDGET_TOKENS,
     ):
         """Initialize the worker adapter for current or legacy vLLM callers.
 
@@ -1346,22 +1337,18 @@ class LMCacheMPWorkerAdapter:
             else:
                 self._mp_transfer_mode = None
             # Hold-K admission coalescing: one switch; K fixed at 2.
-            self._admit_coalesce_k = (
-                2 if cfg[ExtraConfigDefault.admit_coalesce.name] else 0
-            )
+            admit_coalesce = cfg[ExtraConfigDefault.admit_coalesce.name]
             set_ipc_policy(
                 isolated_ipc=cfg[ExtraConfigDefault.isolated_ipc.name],
                 use_vmm_api=cfg[ExtraConfigDefault.use_vmm_api.name],
             )
         else:
             self._mp_transfer_mode = None
-            self._admit_coalesce_k = (
-                2 if ExtraConfigDefault.admit_coalesce.value else 0
-            )
-        self._admit_coalesce_s = _ADMIT_COALESCE_DEADLINE_S
-        self._admit_coalesce_alpha = _ADMIT_COALESCE_ALPHA
-        self._admit_coalesce_eta = _ADMIT_COALESCE_ETA
-        self._admit_coalesce_budget = admit_coalesce_budget
+            admit_coalesce = ExtraConfigDefault.admit_coalesce.value
+        self._coalescer = AdmissionCoalescer(
+            enabled=bool(admit_coalesce),
+            budget_tokens=admit_coalesce_budget,
+        )
         self.req_client = RequestClientFactory.create(server_url, context=context)
         self._mq_timeout = mq_timeout
         self._server_url = server_url
@@ -1389,17 +1376,6 @@ class LMCacheMPWorkerAdapter:
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
-        # request_id -> retrieve submission timestamp.
-        self._ret_submit_ts: dict[str, float] = {}
-        # request_id -> prefill tail in tokens (prompt length minus cache
-        # hit), read from the op because new metadata fields do not
-        # survive SchedulerOutput serialization.
-        self._ret_tail: dict[str, int] = {}
-        # EWMA of retrieve durations (submission to report); None until
-        # the first observation.
-        self._ret_rt_ewma: float | None = None
-        # Cached (mtime, value) of the runtime override file.
-        self._ac_override: tuple[float, bool] | None = None
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
@@ -1450,11 +1426,8 @@ class LMCacheMPWorkerAdapter:
         self._kv_events: list[CacheEvent] = []
         self._kv_event_lock = threading.RLock()
         self._kv_event_server_source = False
-        self._kv_event_subscriber = False
         self._kv_event_incarnation: int | None = None
-        self._kv_event_stream: MessagingStream[KVEventBatch] | None = None
-        self._kv_event_receiver: threading.Thread | None = None
-        self._kv_event_stop = threading.Event()
+        self._kv_event_subscription: MPKVEventSubscriber | None = None
         # CPU chunks this worker has announced and not withdrawn.
         self._announced_kv_hashes: set[bytes] = set()
         if enable_kv_events:
@@ -1906,8 +1879,9 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
-        self._ret_submit_ts[request_id] = time.monotonic()
-        self._ret_tail[request_id] = max(0, len(op.token_ids) - op.end)
+        self._coalescer.on_submit(
+            request_id, max(0, num_packed_tokens(op.token_bytes) - op.end)
+        )
         if event is not None:
             self.retrieve_events[request_id] = event
 
@@ -2029,101 +2003,6 @@ class LMCacheMPWorkerAdapter:
         return ret_stores
 
     @_lmcache_nvtx_annotate
-    def _admit_coalesce_enabled(self) -> bool:
-        """Whether the hold is enabled, honoring the runtime override file.
-
-        The file is re-read only when its mtime changes, so the per-step
-        cost is one stat. When it is absent the startup config governs.
-        """
-        if self._admit_coalesce_k <= 1:
-            return False
-        try:
-            mtime = os.stat(_ADMIT_COALESCE_OVERRIDE_FILE).st_mtime
-        except OSError:
-            return True
-        if self._ac_override is None or self._ac_override[0] != mtime:
-            try:
-                with open(_ADMIT_COALESCE_OVERRIDE_FILE) as f:
-                    value = f.read().strip().lower() in ("1", "true", "on", "yes")
-            except OSError:
-                return True
-            self._ac_override = (mtime, value)
-            logger.info(
-                "admit_coalesce: runtime override -> %s", value
-            )
-        return self._ac_override[1]
-
-    def _admit_coalesce_hold(
-        self, finished_retrieves: set[str]
-    ) -> set[str]:
-        """Hold completed retrieves for one step so that several prefill
-        tails are admitted on the same step boundary.
-
-        Returns an empty set to hold the ready retrieves for one more
-        step (they stay in ``retrieve_futures`` and are re-evaluated on
-        the next call), or the input unchanged to report them now.
-        """
-        if not self._admit_coalesce_enabled() or not self.retrieve_futures:
-            return finished_retrieves
-        if not 0 < len(finished_retrieves) < self._admit_coalesce_k:
-            return finished_retrieves
-        inflight = set(self.retrieve_futures) - finished_retrieves
-        if not inflight:
-            return finished_retrieves
-
-        # A ready request whose tail alone fills a step gains nothing
-        # from waiting, and if even all ready + in-flight tails together
-        # cannot fill a step, waiting cannot produce a full step either.
-        fill_floor = self._admit_coalesce_alpha * self._admit_coalesce_budget
-        tails = self._ret_tail
-        if any(tails.get(r, 0) >= fill_floor for r in finished_retrieves):
-            return finished_retrieves
-        cohort = finished_retrieves | inflight
-        if sum(tails.get(r, 0) for r in cohort) < fill_floor:
-            return finished_retrieves
-
-        now = time.monotonic()
-        oldest_submit = min(
-            self._ret_submit_ts.get(r, 0.0) for r in finished_retrieves
-        )
-        deadline_left = self._admit_coalesce_s - (now - oldest_submit)
-        if deadline_left <= 0:
-            return finished_retrieves
-
-        # Hold only while the earliest in-flight sibling is estimated to
-        # finish before the deadline: its remaining time is the typical
-        # retrieve duration minus how long it has already waited.
-        # Without duration observations, release instead of holding.
-        if self._admit_coalesce_eta:
-            if self._ret_rt_ewma is None:
-                return finished_retrieves
-            eta_min = min(
-                max(0.0, self._ret_rt_ewma - (now - self._ret_submit_ts.get(r, now)))
-                for r in inflight
-            )
-            if eta_min > deadline_left:
-                return finished_retrieves
-
-        return set()
-
-    def _note_retrieve_durations(self, reported: set[str]) -> None:
-        """Update the retrieve-duration EWMA (submission to report).
-
-        Only non-held requests are sampled, so hold time does not
-        inflate the estimate.
-        """
-        now = time.monotonic()
-        for request_id in reported:
-            t0 = self._ret_submit_ts.get(request_id)
-            if t0 is None:
-                continue
-            duration = now - t0
-            self._ret_rt_ewma = (
-                duration
-                if self._ret_rt_ewma is None
-                else 0.8 * self._ret_rt_ewma + 0.2 * duration
-            )
-
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -2167,8 +2046,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
-            self._ret_submit_ts.clear()
-            self._ret_tail.clear()
+            self._coalescer.drain()
             self._pending_store_kv_events.clear()
 
             # Retrieves dropped at submit time still must be reported,
@@ -2227,9 +2105,12 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
-        # Hold-K admission coalescing (see _admit_coalesce_hold).
-        finished_retrieves = self._admit_coalesce_hold(finished_retrieves)
-        self._note_retrieve_durations(finished_retrieves)
+        # Admission coalescing: hold ready retrieves for one more step
+        # when that can fill the step (see AdmissionCoalescer). Held ids
+        # stay in retrieve_futures and are re-evaluated next call.
+        finished_retrieves = self._coalescer.select_to_report(
+            finished_retrieves, set(self.retrieve_futures)
+        )
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
@@ -2238,8 +2119,6 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
-            self._ret_submit_ts.pop(request_id, None)
-            self._ret_tail.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
@@ -2309,8 +2188,7 @@ class LMCacheMPWorkerAdapter:
             self.retrieve_futures.clear()
             self.store_events.clear()
             self.retrieve_events.clear()
-            self._ret_submit_ts.clear()
-            self._ret_tail.clear()
+            self._coalescer.drain()
             self._pending_store_kv_events.clear()
 
             # Retrieves dropped at submit time still must be reported,
@@ -2366,9 +2244,9 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
-        # Hold-K admission coalescing (see _admit_coalesce_hold).
-        finished_retrieves = self._admit_coalesce_hold(finished_retrieves)
-        self._note_retrieve_durations(finished_retrieves)
+        finished_retrieves = self._coalescer.select_to_report(
+            finished_retrieves, set(self.retrieve_futures)
+        )
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
@@ -2377,8 +2255,6 @@ class LMCacheMPWorkerAdapter:
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)
-            self._ret_submit_ts.pop(request_id, None)
-            self._ret_tail.pop(request_id, None)
 
         # Retrieves dropped while unhealthy still must be reported,
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS. No
@@ -2416,20 +2292,19 @@ class LMCacheMPWorkerAdapter:
     def get_kv_events(self) -> list[CacheEvent]:
         """Drain buffered CPU events in order, starting the subscription if needed.
 
-        Server events arrive independently of vLLM model steps. vLLM still
-        controls when this buffer is drained and published to the router.
+        The shared subscriber receives server batches independently of model
+        steps; this adapter converts them on its notification callback. vLLM
+        controls when the resulting buffer is drained and published.
+
+        Returns:
+            Buffered CPU events, or an empty list when disabled or unchanged.
         """
         if not self._kv_events_enabled:
             return []
         self._ensure_heartbeat_started()
         with self._kv_event_lock:
-            if self._kv_event_subscriber and self._kv_event_receiver is None:
-                self._kv_event_receiver = threading.Thread(
-                    target=self._receive_kv_events,
-                    daemon=True,
-                    name="lmcache-kv-events",
-                )
-                self._kv_event_receiver.start()
+            if self._kv_event_subscription is not None:
+                self._kv_event_subscription.start()
             events, self._kv_events = self._kv_events, []
             self._kv_events_drained.inc(len(events))
             self._kv_events_buffered.set(0)
@@ -2550,16 +2425,13 @@ class LMCacheMPWorkerAdapter:
         """
         Shutdown the LMCache MP worker adapter.
 
+        Closes the subscriber before stopping heartbeat and unregistering.
         Stops the heartbeat (if started) before UNREGISTER: no new ping
         on the closing request client, and a straggler in-flight cycle cannot
         re-register or flip the health event after unregistration.
         """
-        self._kv_event_stop.set()
-        with self._kv_event_lock:
-            if self._kv_event_stream is not None:
-                self._kv_event_stream.close()
-        if self._kv_event_receiver is not None:
-            self._kv_event_receiver.join()
+        if self._kv_event_subscription is not None:
+            self._kv_event_subscription.close()
 
         with self._heartbeat_lock:
             if self._heartbeat is not None:
@@ -2602,46 +2474,17 @@ class LMCacheMPWorkerAdapter:
             self._kv_events_generated.inc(len(events))
             self._kv_events_buffered.set(len(self._kv_events))
 
-    def _receive_kv_events(self) -> None:
-        """Receive pushes; reconnect after disconnect without periodic fetches."""
-        while not self._kv_event_stop.is_set():
-            stream = None
-            try:
-                stream = self.req_client.subscribe_kv_events(
-                    self.instance_id,
-                    self.model_name,
-                    0,
-                    _KV_EVENT_BATCH_SIZE,
-                )
-                with self._kv_event_lock:
-                    if self._kv_event_stop.is_set():
-                        return
-                    self._kv_event_stream = stream
-                for batch in stream:
-                    with self._kv_event_lock:
-                        if self._kv_event_stop.is_set():
-                            return
-                        self._apply_kv_event_batch(batch)
-                        if not self._kv_event_server_source:
-                            return
-                raise ConnectionError("KV event subscription ended")
-            except ConnectionError as exc:
-                if not self._kv_event_stop.is_set():
-                    with self._kv_event_lock:
-                        logger.warning("Reconnecting KV event subscription: %s", exc)
+    def _drain_kv_event_updates(self, subscriber: MPKVEventSubscriber) -> None:
+        """Apply pushes on the receiver thread without waiting for a vLLM step."""
+        with self._kv_event_lock:
+            for update in subscriber.drain():
+                if isinstance(update, KVEventStreamClosed):
+                    if update.error is None:
                         self._resync_kv_events("stream_closed")
-            except Exception as exc:
-                if not self._kv_event_stop.is_set():
-                    with self._kv_event_lock:
-                        self._disable_kv_event_stream(str(exc))
-                return
-            finally:
-                if stream is not None:
-                    stream.close()
-                with self._kv_event_lock:
-                    self._kv_event_stream = None
-            if self._kv_event_stop.wait(_KV_EVENT_RECONNECT_DELAY):
-                return
+                    else:
+                        self._disable_kv_event_stream(update.error)
+                else:
+                    self._apply_kv_event_batch(update)
 
     def _disable_kv_event_stream(self, reason: str) -> None:
         """Withdraw placements and resume completed-store reporting after failure."""
@@ -2651,18 +2494,23 @@ class LMCacheMPWorkerAdapter:
             "longer learns LMCache host-cache evictions from it",
             reason,
         )
-        self._kv_event_subscriber = False
         self._kv_event_server_source = False
         self._resync_kv_events("stream_closed")
 
     def _resolve_kv_event_source(
         self, enable_kv_events: bool, parallel_strategy: ParallelStrategy
     ) -> None:
-        """Use server records; elect one subscriber per server."""
+        """Use server records on all ranks; create one subscriber per server."""
         if not enable_kv_events:
             return
         self._kv_event_server_source = True
-        self._kv_event_subscriber = parallel_strategy.is_kv_event_subscriber
+        if parallel_strategy.is_kv_event_subscriber:
+            self._kv_event_subscription = MPKVEventSubscriber(
+                self.req_client,
+                self.instance_id,
+                self.model_name,
+                self._drain_kv_event_updates,
+            )
 
     def _apply_kv_event_batch(self, result: KVEventBatch) -> None:
         """Buffer one pushed batch; the caller holds the event lock."""
