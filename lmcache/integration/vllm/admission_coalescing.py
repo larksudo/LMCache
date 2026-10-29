@@ -4,9 +4,17 @@
 Holds completed KV retrieves for one engine step so that several
 prefill tails are admitted on the same step boundary and the per-step
 token budget is filled. See docs/design/v1/multiprocess/admission_coalescing.md.
+
+Tuning build: parameters (alpha, K, deadline, sum condition, ETA) are
+re-read from a control file on mtime change, so A/B sweeps can flip
+configurations between benchmark passes without restarting vLLM. The
+file also toggles the switch itself, so off/on arms alternate without a
+restart too. See _TUNING_FILE below for the format.
 """
 
 # Standard
+import json
+import os
 import time
 
 # First Party
@@ -18,26 +26,48 @@ logger = init_logger(__name__)
 # max_num_batched_tokens, so this only applies to direct construction.
 DEFAULT_BUDGET_TOKENS: int = 8192
 
-# Hold deadline in seconds, measured from retrieve submission. This is
-# deliberately generous: it must comfortably exceed the typical sibling
-# retrieve duration (d), otherwise a sibling submitted shortly after the
-# ready request can never arrive inside the window and every hold is
-# wasted latency. On our benchmark d converges to ~260 ms and the
-# measured hold durations stay well under 1 s, so 3 s gives the ETA
-# condition room to admit real siblings. An adaptive variant
-# (factor * d EWMA) was tested and rejected: it collapsed the window to
-# ~0.6 s on fast deployments and the coalescing never fired.
+# Tuning control file. When present, its JSON content overrides the
+# compile-time defaults AND the startup switch on the fly (mtime-cached,
+# one stat per gate call). Absent file = startup config governs.
+# Format: {"on": true|false, "alpha": 0.75, "k": 3,
+#          "deadline_s": 3.0, "sum": true, "eta": true}
+_TUNING_FILE = "/tmp/lmc_ac_tuning.json"
+
+# Compile-time defaults (used until the tuning file says otherwise).
 _DEADLINE_S: float = 3.0
-# Fraction of the step budget that counts as a full step.
 _FILL_ALPHA: float = 0.75
-# Number of ready retrieves to coalesce.
 _K: int = 3
-# Enable the sibling-ETA release condition.
+_SUM_GUARD: bool = True
 _SIBLING_ETA: bool = True
-# Log a decision summary every N gate calls (0 = never). The summary
-# (hold rate, duration EWMA) is what the deadline and alpha were tuned
-# from; keep it cheap enough to leave on in production.
+# Log a decision summary every N gate calls (0 = never).
 _LOG_EVERY: int = 2000
+
+
+class _Tuning:
+    """Mtime-cached view of _TUNING_FILE; falls back to defaults."""
+
+    def __init__(self) -> None:
+        self._cache: tuple[float, dict] | None = None
+
+    def get(self) -> dict:
+        try:
+            mtime = os.stat(_TUNING_FILE).st_mtime
+        except OSError:
+            return {}
+        if self._cache is None or self._cache[0] != mtime:
+            try:
+                with open(_TUNING_FILE) as f:
+                    cfg = json.load(f)
+                if isinstance(cfg, dict):
+                    self._cache = (mtime, cfg)
+                    logger.info("admit_coalesce tuning: %s", cfg)
+                    return cfg
+            except (OSError, ValueError):
+                pass
+        return self._cache[1] if self._cache else {}
+
+
+_TUNING = _Tuning()
 
 
 class AdmissionCoalescer:
@@ -59,23 +89,23 @@ class AdmissionCoalescer:
         # EWMA of retrieve durations (submission to report); None until
         # the first observation.
         self._duration_ewma: float | None = None
-        # Periodic decision summary (every _LOG_EVERY calls).
+        # Periodic decision summary counters.
         self._log_calls = 0
         self._log_holds = 0
+        # Per-branch release counters for the summary line.
+        self._rel = {
+            "k": 0, "nosib": 0, "tail": 0, "sum": 0,
+            "dl": 0, "eta": 0, "cold": 0,
+        }
         # request_id -> timestamp of the first hold decision, used to
-        # subtract hold time from duration samples (the EWMA feeds the
-        # adaptive deadline, so uncorrected samples would form a
-        # self-amplifying loop: longer holds -> larger EWMA -> longer
-        # deadline -> longer holds).
+        # subtract hold time from duration samples.
         self._first_hold: dict[str, float] = {}
 
-    def on_submit(self, request_id: str, tail_tokens: int) -> None:
-        """Record submission time and prefill tail for a retrieve.
+    def _cfg(self, key: str, default):
+        return type(default)(_TUNING.get().get(key, default))
 
-        The tail is computed by the adapter from the op itself
-        (packed token count minus the cached range) because new metadata
-        fields do not survive SchedulerOutput serialization.
-        """
+    def on_submit(self, request_id: str, tail_tokens: int) -> None:
+        """Record submission time and prefill tail for a retrieve."""
         self._submit_ts[request_id] = time.monotonic()
         self._tail[request_id] = tail_tokens
 
@@ -99,15 +129,30 @@ class AdmissionCoalescer:
         if _LOG_EVERY and self._enabled:
             self._log_calls += 1
             if self._log_calls % _LOG_EVERY == 0:
+                rel = self._rel
+                tot = sum(rel.values()) or 1
                 logger.info(
-                    "admit_coalesce: calls=%d holds=%d ewma_ms=%s "
-                    "deadline_ms=%d",
+                    "admit_coalesce: calls=%d holds=%d(%.1f%%) "
+                    "rel{k=%d(%.0f%%),nosib=%d(%.0f%%),tail=%d,sum=%d,"
+                    "dl=%d,eta=%d,cold=%d} ewma_ms=%s "
+                    "cfg{a=%.2f,k=%d,T=%.1f,sum=%d,eta=%d}",
                     self._log_calls,
                     self._log_holds,
+                    self._log_holds / self._log_calls * 100,
+                    rel["k"], rel["k"] / tot * 100,
+                    rel["nosib"], rel["nosib"] / tot * 100,
+                    rel["tail"], rel["sum"],
+                    rel["dl"], rel["eta"], rel["cold"],
                     f"{self._duration_ewma * 1000:.0f}"
                     if self._duration_ewma is not None else "n/a",
-                    int(_DEADLINE_S * 1000),
+                    self._cfg("alpha", _FILL_ALPHA),
+                    self._cfg("k", _K),
+                    self._cfg("deadline_s", _DEADLINE_S),
+                    self._cfg("sum", _SUM_GUARD),
+                    self._cfg("eta", _SIBLING_ETA),
                 )
+                for k in self._rel:
+                    self._rel[k] = 0
         for request_id in ready - reported:
             self._first_hold.setdefault(request_id, now)
         self._note_durations(reported)
@@ -121,51 +166,56 @@ class AdmissionCoalescer:
         """Hold completed retrieves for one step so that several prefill
         tails are admitted on the same step boundary.
 
-        Release is implicit when any condition stops holding: K or more
-        ready, no sibling retrieve in flight, a ready tail alone fills a
-        step, the deadline (from submit) expired, or the earliest
-        in-flight sibling is estimated to arrive after it.
+        Release is implicit when any condition stops holding. Each
+        release path bumps its counter so the periodic summary shows
+        which branch dominates.
         """
-        if not self._enabled or not pending:
+        cfg = _TUNING.get()
+        if not self._enabled:
             return ready
-        if not 0 < len(ready) < _K:
+        if cfg.get("on") is False:
+            return ready  # tuning file forces the arm off
+        if not pending:
+            return ready
+        k = int(cfg.get("k", _K))
+        if not 0 < len(ready) < k:
+            self._rel["k"] += 1
             return ready
         inflight = pending - ready
         if not inflight:
+            self._rel["nosib"] += 1
             return ready
 
-        # A ready request whose tail alone fills a step gains nothing
-        # from waiting: a sibling cannot join an already-full step. And
-        # if even all ready + in-flight tails together cannot fill a
-        # step, waiting cannot produce a full step either (K counts
-        # requests, not tokens -- K small tails still batch to a thin
-        # step).
-        fill_floor = _FILL_ALPHA * self._budget
+        alpha = float(cfg.get("alpha", _FILL_ALPHA))
+        fill_floor = alpha * self._budget
         tails = self._tail
         if any(tails.get(r, 0) >= fill_floor for r in ready):
+            self._rel["tail"] += 1
             return ready
-        cohort = ready | inflight
-        if sum(tails.get(r, 0) for r in cohort) < fill_floor:
-            return ready
+        if cfg.get("sum", _SUM_GUARD):
+            cohort = ready | inflight
+            if sum(tails.get(r, 0) for r in cohort) < fill_floor:
+                self._rel["sum"] += 1
+                return ready
 
+        deadline_s = float(cfg.get("deadline_s", _DEADLINE_S))
         now = time.monotonic()
         oldest_submit = min(self._submit_ts.get(r, 0.0) for r in ready)
-        deadline_left = _DEADLINE_S - (now - oldest_submit)
+        deadline_left = deadline_s - (now - oldest_submit)
         if deadline_left <= 0:
+            self._rel["dl"] += 1
             return ready
 
-        # Hold only while the earliest in-flight sibling is estimated to
-        # finish before the deadline: its remaining time is the typical
-        # retrieve duration minus how long it has already waited.
-        # Without duration observations, release instead of holding.
-        if _SIBLING_ETA:
+        if cfg.get("eta", _SIBLING_ETA):
             if self._duration_ewma is None:
+                self._rel["cold"] += 1
                 return ready
             eta_min = min(
                 max(0.0, self._duration_ewma - (now - self._submit_ts.get(r, now)))
                 for r in inflight
             )
             if eta_min > deadline_left:
+                self._rel["eta"] += 1
                 return ready
 
         return set()
