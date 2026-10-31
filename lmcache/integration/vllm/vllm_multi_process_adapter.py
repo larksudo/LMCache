@@ -148,9 +148,15 @@ class ExtraConfigDefault(enum.Enum):
     # key wins when both are set.
     mp_transfer_mode = "auto"
     # Hold completed retrieves briefly so that several prefill tails
-    # are admitted on the same step boundary and the per-step token
-    # budget is filled. Default off.
+    # are admitted on the same step boundary and one prefill step is
+    # removed. Default off.
     admit_coalesce = False
+    # Upper bound on the engine steps one completed retrieve may be held.
+    # The gate never exceeds it, so it also bounds the added TTFT.
+    admit_coalesce_max_hold_steps = 2
+    # Expected joins required per step of hold: the single TTFT/TPOT
+    # tradeoff knob. Higher protects TTFT, lower favours TPOT.
+    admit_coalesce_latency_weight = 1.0
     # Whether IPC mechanisms must work across isolated containers (no
     # shared host IPC namespace or /dev/shm); see
     # lmcache.v1.platform.ipc_policy. Must match the LMCache server's
@@ -1339,8 +1345,16 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
-            # Hold-K admission coalescing: one switch; K fixed at 3.
+            # Admission coalescing: one switch plus the tradeoff knob. The
+            # token target and the hold window are derived by the gate from
+            # the measured step and completion statistics.
             admit_coalesce = cfg[ExtraConfigDefault.admit_coalesce.name]
+            admit_coalesce_max_hold_steps = cfg[
+                ExtraConfigDefault.admit_coalesce_max_hold_steps.name
+            ]
+            admit_coalesce_latency_weight = cfg[
+                ExtraConfigDefault.admit_coalesce_latency_weight.name
+            ]
             set_ipc_policy(
                 isolated_ipc=cfg[ExtraConfigDefault.isolated_ipc.name],
                 use_vmm_api=cfg[ExtraConfigDefault.use_vmm_api.name],
@@ -1348,9 +1362,17 @@ class LMCacheMPWorkerAdapter:
         else:
             self._mp_transfer_mode = None
             admit_coalesce = ExtraConfigDefault.admit_coalesce.default
+            admit_coalesce_max_hold_steps = (
+                ExtraConfigDefault.admit_coalesce_max_hold_steps.default
+            )
+            admit_coalesce_latency_weight = (
+                ExtraConfigDefault.admit_coalesce_latency_weight.default
+            )
         self._coalescer = AdmissionCoalescer(
             enabled=bool(admit_coalesce),
             budget_tokens=admit_coalesce_budget,
+            max_hold_steps=int(admit_coalesce_max_hold_steps),
+            latency_weight=float(admit_coalesce_latency_weight),
         )
         self.req_client = RequestClientFactory.create(server_url, context=context)
         self._mq_timeout = mq_timeout
@@ -2108,13 +2130,14 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
-        # Admission coalescing: hold ready retrieves for one more step
-        # when that can fill the step (see AdmissionCoalescer). Held ids
+        # Admission coalescing: hold ready retrieves for one more step when
+        # that can remove a prefill step (see AdmissionCoalescer). Held ids
         # stay in retrieve_futures and are re-evaluated next call. Failed
-        # retrieves bypass the gate: holding them would delay the error
-        # path and skew the duration EWMA.
-        finished_retrieves = self._coalescer.select_to_report(
-            finished_retrieves, set(self.retrieve_futures)
+        # retrieves bypass the gate: holding them would delay the error path
+        # and charge latency for an admission that is already lost.
+        failed = finished_retrieves & self._failed_request_ids
+        finished_retrieves = failed | self._coalescer.select_to_report(
+            finished_retrieves - failed, set(self.retrieve_futures)
         )
 
         # Remove the finished requests from the tracking dicts
@@ -2171,7 +2194,8 @@ class LMCacheMPWorkerAdapter:
                 (reported exactly once; blocks already in error_block_ids).
                 When ``lmcache.mp.admit_coalesce`` is enabled, a completed
                 retrieve may be intentionally held back for one or more
-                engine steps (bounded by the hold deadline, default 3 s).
+                engine steps (bounded by
+                ``lmcache.mp.admit_coalesce_max_hold_steps``, default 2).
         """
         if not self.lazy_offload:
             raise ValueError(
@@ -2253,8 +2277,9 @@ class LMCacheMPWorkerAdapter:
                 )
 
         # Same gate as get_finished; failed retrieves bypass it.
-        finished_retrieves = self._coalescer.select_to_report(
-            finished_retrieves, set(self.retrieve_futures)
+        failed = finished_retrieves & self._failed_request_ids
+        finished_retrieves = failed | self._coalescer.select_to_report(
+            finished_retrieves - failed, set(self.retrieve_futures)
         )
 
         # Remove the finished requests from the tracking dicts
