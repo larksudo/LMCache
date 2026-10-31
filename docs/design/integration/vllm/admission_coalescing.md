@@ -24,7 +24,7 @@ Holding happens in `get_finished()`; the user enables it with:
 
 Holding is only worth its latency when the coalesced tails **fit one
 step**. The gate therefore prices a hold in the unit cost and benefit
-share â€” the engine step:
+share â€?the engine step:
 
 - cost: the held request waits `w` steps longer, so its TTFT grows by `w`
   steps;
@@ -40,14 +40,14 @@ token target has to be picked: both sides count steps.
 | Symbol | Meaning | Source | Default |
 |---|---|---|---|
 | switch | enable the mechanism | user config | false |
-| B | per-step token budget | vLLM `max_num_batched_tokens`, passed by the connector | â€” |
+| B | per-step token budget | vLLM `max_num_batched_tokens`, passed by the connector | â€?|
 | weight | expected joins required per step of hold | user config | 1.0 |
 | max_hold_steps | upper bound on steps one retrieve is held | user config | 2 |
 | step | engine step duration | measured: gap between consecutive gate calls | learned |
 | gap | retrieve completion interval | measured: gap between consecutive completions | learned |
 | tail | prefill tail of a request | read from the op at submit time | learned |
 | head | tokens a step can give to prefill | `B * (1 - 0.2)`, the reserve leaves room for decode | derived |
-| fits | further tails that fit beside the ready ones | `(head - ready_tail) / tail` | derived |
+| fits | further in-flight tails that fit beside the ready ones | counted from the real in-flight tails, smallest first | derived |
 
 Per-request state: submission timestamp, prefill tail in tokens, and the
 number of steps already held. New metadata fields do not survive
@@ -73,10 +73,10 @@ on each get_finished() call (once per engine step):
         no inflight sibling                              # nothing to wait for
         ready tail is zero                               # no prefill step to save
         sum(ready tails) > head                          # cannot fit one step
-        (head - sum(ready tails)) / tail < 1             # no room for a sibling
+        no in-flight tail fits beside the ready ones   # no room for a sibling
         step or gap not measured yet                     # cold start: no price
         steps_held + 1 > max_hold_steps                  # bound reached
-        p_join * min(fits, len(inflight)) < weight * (steps_held + 1)
+        p_join * fits < weight * (steps_held + 1)
                                                          # joins cannot pay
 
     otherwise: hold the ready retrieves for one step
@@ -91,25 +91,25 @@ after reporting: update the hold statistics from each reported request
 
 ## Why each release condition
 
-- **No sibling in flight** â€” with nothing left to wait for, holding is
+- **No sibling in flight** â€?with nothing left to wait for, holding is
   pure latency.
-- **Zero ready tail** â€” a fully cached request has no prefill step of its
+- **Zero ready tail** â€?a fully cached request has no prefill step of its
   own to remove, so merging it saves nothing.
-- **The cohort cannot fit one step** â€” the whole point of a hold is to
+- **The cohort cannot fit one step** â€?the whole point of a hold is to
   replace N prefill steps with fewer. Two 4096-token tails against an 8192
   budget never share a step (the decode reserve leaves a 6554-token head),
   so holding them adds latency and removes nothing. This condition is what
   keeps the mechanism from regressing on long-tail workloads, where a
   fill-ratio guard such as `sum(tails) >= alpha * B` is satisfied while the
   merge is impossible.
-- **No room for a sibling** â€” the same arithmetic one step further: if
+- **No room for a sibling** â€?the same arithmetic one step further: if
   `head - ready_tail` cannot hold another tail, a sibling cannot join the
   step even if it arrives.
-- **Cold start** â€” until the step duration and the completion gap have
+- **Cold start** â€?until the step duration and the completion gap have
   been observed, a hold cannot be priced. Reporting keeps the status quo.
-- **Bound reached** â€” `max_hold_steps` caps the added TTFT; a hold that
+- **Bound reached** â€?`max_hold_steps` caps the added TTFT; a hold that
   outlives its bound is a latency leak, not coalescing.
-- **Joins cannot pay** â€” the only economic condition. The completion gap
+- **Joins cannot pay** â€?the only economic condition. The completion gap
   says how long the next sibling needs; the fit count caps how many can
   share the step. If the expected joins do not cover `weight` steps of
   hold, the request is reported and admitted immediately.
@@ -120,9 +120,7 @@ after reporting: update the hold statistics from each reported request
 acceptance criteria, and a summary line is logged every 2000 gate calls:
 
 ```
-admit_coalesce: calls=â€¦ holds=â€¦ held=â€¦ merges=â€¦ merge_rate=â€¦ saved_steps=â€¦
-                hold_ms{mean=â€¦,max=â€¦,n=â€¦} step_ms=â€¦ gap_ms=â€¦ tail=â€¦
-                reasons={nosib=â€¦, fit=â€¦, cost=â€¦, hold=â€¦, cold=â€¦}
+admit_coalesce: calls=â€?holds=â€?held=â€?merges=â€?merge_rate=â€?saved_steps=â€?                hold_ms{mean=â€?max=â€?n=â€¦} step_ms=â€?gap_ms=â€?tail=â€?                reasons={nosib=â€? fit=â€? cost=â€? hold=â€? cold=â€¦}
 ```
 
 - `merge_rate` (merges / hold events) is the gate's own hit rate. A gate

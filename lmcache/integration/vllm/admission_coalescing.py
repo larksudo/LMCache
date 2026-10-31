@@ -27,6 +27,7 @@ workload:
 
 # Standard
 import time
+from collections.abc import Iterable
 
 # First Party
 from lmcache.logging import init_logger
@@ -249,16 +250,18 @@ class AdmissionCoalescer:
             return self._release("noprefill")
         if ready_tail > head:
             return self._release("fit")
-        if (
-            self._step_ewma is None
-            or self._gap_ewma is None
-            or self._tail_ewma is None
-        ):
+        if self._step_ewma is None or self._gap_ewma is None:
             return self._release("cold")
 
-        # Tails that fit beside the ready ones: no room means a sibling could
-        # never share their step, so holding cannot remove a step.
-        fits = int((head - ready_tail) // max(self._tail_ewma, 1.0))
+        # Tails that fit beside the ready ones, counted from the actual
+        # in-flight tails: a sibling can only join if the step has room for its
+        # real tail. An average over all tails would be dragged to zero by
+        # fully cached requests and would then admit siblings that cannot fit,
+        # which turns every hold into pure latency.
+        fits = _count_fitting(
+            (self._tail.get(request_id, 0) for request_id in inflight),
+            head - ready_tail,
+        )
         if fits < 1:
             return self._release("fit")
 
@@ -269,10 +272,9 @@ class AdmissionCoalescer:
         # Expected joins if we hold for ``waited`` steps: the completion gap
         # says how long the next sibling needs, the fit count caps how many can
         # join the same step.
-        joins = min(fits, len(inflight))
         window = waited * self._step_ewma
         p_join = min(1.0, window / max(self._gap_ewma, self._step_ewma))
-        if p_join * joins < self._latency_weight * waited:
+        if p_join * fits < self._latency_weight * waited:
             return self._release("cost")
         return ready
 
@@ -356,6 +358,27 @@ class AdmissionCoalescer:
             int(stats["tail_tokens"]),
             self.release_reasons(),
         )
+
+
+def _count_fitting(tails: Iterable[int], room: int) -> int:
+    """Count how many sibling tails fit into *room* tokens, smallest first.
+
+    Args:
+        tails: Prefill tails of the in-flight siblings, in tokens.
+        room: Tokens still available in the step.
+
+    Returns:
+        How many siblings can share the step with the ready ones. A sibling
+        with a zero tail is not counted: a fully cached request carries no
+        prefill step, so merging it removes nothing.
+    """
+    count = 0
+    for tail in sorted(tails):
+        if tail <= 0 or tail > room:
+            continue
+        room -= tail
+        count += 1
+    return count
 
 
 def _ewma(current: float, sample: float) -> float:

@@ -119,6 +119,24 @@ def test_tails_that_cannot_share_a_step_are_not_held(clock: _Clock) -> None:
     assert gate.release_reasons().get("fit") == 1
 
 
+def test_zero_tail_siblings_do_not_admit_a_wide_cohort(clock: _Clock) -> None:
+    """A fully cached sibling must not make room look bigger than it is.
+
+    ``b`` carries no prefill, so it is not a coalescing candidate; ``c`` does
+    carry a 4096-token tail and cannot fit beside ``a``. Averaging tails over
+    the ready and in-flight sets would drag the estimate towards ``b`` and let
+    the gate hold a pair that cannot share a step.
+    """
+    gate = _primed_gate(clock, tail=4096)
+    gate.on_submit("a", 4096)
+    gate.on_submit("b", 0)
+    gate.on_submit("c", 4096)
+    clock.advance_ms(50)
+
+    assert gate.select_to_report({"a"}, {"a", "b", "c"}) == {"a"}
+    assert gate.release_reasons().get("fit") == 1
+
+
 def test_holds_when_a_sibling_is_expected_within_one_step(clock: _Clock) -> None:
     """A 50 ms gap against a 50 ms step makes one join certain."""
     gate = _primed_gate(clock)
