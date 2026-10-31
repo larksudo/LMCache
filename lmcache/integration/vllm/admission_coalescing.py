@@ -27,7 +27,7 @@ _DEADLINE_S: float = 3.0
 # Fraction of the step budget that counts as a full step.
 _FILL_ALPHA: float = 0.75
 # Number of ready retrieves to coalesce.
-_K: int = 3
+_K: int = 2
 # Log a decision summary every N gate calls (0 = never). The summary
 # (hold rate, duration EWMA) is what the deadline and alpha were tuned
 # from; keep it cheap enough to leave on in production.
@@ -147,37 +147,10 @@ class AdmissionCoalescer:
         if not inflight:
             return ready
 
-        # A ready request whose tail alone fills a step gains nothing
-        # from waiting: a sibling cannot join an already-full step. And
-        # if even all ready + in-flight tails together cannot fill a
-        # step, waiting cannot produce a full step either (K counts
-        # requests, not tokens -- K small tails still batch to a thin
-        # step).
-        fill_floor = _FILL_ALPHA * self._budget
-        tails = self._tail
-        if any(tails.get(r, 0) >= fill_floor for r in ready):
-            return ready
-        cohort = ready | inflight
-        if sum(tails.get(r, 0) for r in cohort) < fill_floor:
-            return ready
-
         now = time.monotonic()
         oldest_submit = min(self._submit_ts.get(r, 0.0) for r in ready)
         deadline_left = _DEADLINE_S - (now - oldest_submit)
         if deadline_left <= 0:
-            return ready
-
-        # Hold only while the earliest in-flight sibling is estimated to
-        # finish before the deadline: its remaining time is the typical
-        # retrieve duration minus how long it has already waited.
-        # Without duration observations, release instead of holding.
-        if self._duration_ewma is None:
-            return ready
-        eta_min = min(
-            max(0.0, self._duration_ewma - (now - self._submit_ts.get(r, now)))
-            for r in inflight
-        )
-        if eta_min > deadline_left:
             return ready
 
         return set()
