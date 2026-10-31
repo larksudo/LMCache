@@ -53,9 +53,12 @@ _EWMA_ALPHA: float = 0.3
 # arrival rate; sampling it would make the gate refuse to hold for minutes
 # after any lull.
 _MAX_GAP_S: float = 5.0
-# Log the decision summary every N gate calls (0 = never). One line per 2000
-# engine steps is the mechanism's only production observability.
+# Log the decision summary every N gate calls or every _LOG_INTERVAL_S seconds,
+# whichever comes first, and never more often than the interval allows. A pure
+# call-count cadence leaves short runs (a few thousand steps) without a single
+# line, which is exactly when the counters are needed to explain a result.
 _LOG_EVERY: int = 2000
+_LOG_INTERVAL_S: float = 60.0
 
 
 class AdmissionCoalescer:
@@ -107,6 +110,9 @@ class AdmissionCoalescer:
         self._tail_ewma: float | None = None
         self._last_call_ts: float | None = None
         self._last_ready_ts: float | None = None
+        # 0.0 makes the first gate call log the opening summary, so a short run
+        # still shows whether the gate is alive and what it decided.
+        self._last_log_ts: float = 0.0
 
         # Decision summary counters.
         self._calls = 0
@@ -324,9 +330,13 @@ class AdmissionCoalescer:
         self._gap_ewma = gap if self._gap_ewma is None else _ewma(self._gap_ewma, gap)
 
     def _maybe_log(self) -> None:
-        """Emit the decision summary every ``_LOG_EVERY`` gate calls."""
-        if not _LOG_EVERY or self._calls % _LOG_EVERY:
+        """Emit the decision summary on the call-count or the time cadence."""
+        due_by_calls = _LOG_EVERY and not self._calls % _LOG_EVERY
+        now = self._last_call_ts if self._last_call_ts is not None else 0.0
+        due_by_time = now - self._last_log_ts >= _LOG_INTERVAL_S
+        if not due_by_calls and not due_by_time:
             return
+        self._last_log_ts = now
         stats = self.stats()
         logger.info(
             "admit_coalesce: calls=%d holds=%d held=%d merges=%d "
