@@ -30,7 +30,7 @@ _FILL_ALPHA: float = 0.75
 # Number of ready retrieves to coalesce.
 _K: int = 3
 # Log a decision summary every N gate calls (0 = never).
-_LOG_EVERY: int = 2000
+_LOG_EVERY: int = 200
 # Duration buckets in log2(tail_tokens): ~256, ~1K, ~4K, ~16K, ~64K.
 _DURATION_BUCKETS: tuple[int, ...] = (8, 10, 12, 14, 16)
 # EWMA decay rate for per-bucket duration estimates.
@@ -136,7 +136,7 @@ class AdmissionCoalescer:
                     )
                     or "n/a"
                 )
-                logger.debug(
+                logger.info(
                     "admit_coalesce: calls=%d holds=%d ewma[%s] deadline_ms=%d",
                     self._log_calls,
                     self._log_holds,
