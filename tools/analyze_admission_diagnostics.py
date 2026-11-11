@@ -28,9 +28,13 @@ import re
 import statistics
 import sys
 
-ADM_RE = re.compile(r"ADM_DIAG (?P<kv>rid=.*?)(?=\s+ADM_DIAG |\s+STEP_DIAG |$)")
-STEP_RE = re.compile(r"STEP_DIAG (?P<kv>step=.*?)(?=\s+ADM_DIAG |\s+STEP_DIAG |$)")
-KV_RE = re.compile(r"(\w+)=(-?[\w.]+)")
+ADM_RE = re.compile(
+    r"ADM_DIAG (?P<kv>rid=.*?)(?=\s+ADM_DIAG |\s+STEP_DIAG |$)", re.MULTILINE
+)
+STEP_RE = re.compile(
+    r"STEP_DIAG (?P<kv>step=.*?)(?=\s+ADM_DIAG |\s+STEP_DIAG |$)", re.MULTILINE
+)
+KV_RE = re.compile(r"(\w+)=(-?[\w.\-]+)")
 
 # ADM_DIAG fields
 INT_FIELDS = {
