@@ -291,3 +291,72 @@ def test_k_reached_still_releases():
     for rid in ("a", "b", "c"):
         c.on_submit(rid, TWO_TAILS)
     assert c.select_to_report({"a", "b", "c"}, {"a", "b", "c"}) == {"a", "b", "c"}
+
+
+# --- Price-knob regression tests: defaults must reproduce the shipped
+# --- constants; non-defaults enable the hold-cost upper-bound experiment.
+
+
+def _make_custom(**kwargs) -> AdmissionCoalescer:
+    return AdmissionCoalescer(enabled=True, budget_tokens=BUDGET, **kwargs)
+
+
+def test_default_knobs_reproduce_shipped_constants():
+    c = _make()
+    assert c._deadline_s == 3.0
+    assert c._fill_alpha == 0.75
+    assert c._coalesce_min == 2
+    assert c._require_eta is True
+
+
+def test_fill_alpha_zero_disables_fill_floor_and_holds_big_tail():
+    """fill_alpha <= 0 must disable the fill checks, not make them always true.
+
+    With defaults a 30000-token tail is >= fill_floor and releases via
+    TAIL_FILLS_STEP; with the check off and require_eta off, the same shape
+    holds -- that is the forced-merge upper-bound configuration.
+    """
+    c_default = _make()
+    c_ub = _make_custom(fill_alpha=0.0, require_eta=False)
+    for c in (c_default, c_ub):
+        c.on_submit("a", 30000)
+        c.on_submit("b", 30000)
+    assert c_default.select_to_report({"a"}, {"a", "b"}) == {"a"}
+    assert c_ub.select_to_report({"a"}, {"a", "b"}) == set()
+
+
+def test_fill_alpha_zero_holds_cohort_that_cannot_fill_a_step():
+    c_ub = _make_custom(fill_alpha=0.0, require_eta=False)
+    c_default = _make()
+    for c in (c_default, c_ub):
+        c.on_submit("a", 100)
+        c.on_submit("b", 100)
+    # Defaults: 200 total << fill_floor -> COHORT_TOO_SMALL release.
+    assert c_default.select_to_report({"a"}, {"a", "b"}) == {"a"}
+    assert c_ub.select_to_report({"a"}, {"a", "b"}) == set()
+
+
+def test_require_eta_false_holds_without_observations():
+    """No EWMA observations: defaults release with NO_ETA; require_eta off holds."""
+    c_ub = _make_custom(require_eta=False)
+    c_default = _make()
+    for c in (c_default, c_ub):
+        c.on_submit("a", TWO_TAILS)
+        c.on_submit("b", TWO_TAILS)
+    assert c_default.select_to_report({"a"}, {"a", "b"}) == {"a"}
+    assert c_ub.select_to_report({"a"}, {"a", "b"}) == set()
+
+
+def test_deadline_knob_shortens_the_hold_window():
+    c = _make_custom(require_eta=False, deadline_s=0.5)
+    c.on_submit("a", TWO_TAILS)
+    c.on_submit("b", TWO_TAILS)
+    c._submit_ts["a"] = time.monotonic() - 1.0
+    assert c.select_to_report({"a"}, {"a", "b"}) == {"a"}
+
+
+def test_coalesce_min_one_releases_a_single_ready():
+    c = _make_custom(coalesce_min=1, require_eta=False)
+    c.on_submit("a", TWO_TAILS)
+    c.on_submit("b", TWO_TAILS)
+    assert c.select_to_report({"a"}, {"a", "b"}) == {"a"}

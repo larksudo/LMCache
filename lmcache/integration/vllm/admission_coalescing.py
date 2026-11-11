@@ -78,9 +78,24 @@ class AdmissionCoalescer:
         enabled: bool,
         budget_tokens: int,
         record_decisions: bool = False,
+        *,
+        deadline_s: float = _DEADLINE_S,
+        fill_alpha: float = _FILL_ALPHA,
+        coalesce_min: int = _COALESCE_MIN,
+        require_eta: bool = True,
     ) -> None:
         self._enabled = enabled
         self._budget = budget_tokens
+        # Gate price knobs. The defaults reproduce the module constants
+        # exactly; non-default values exist so the hold-cost upper-bound
+        # experiment (hold aggressively, ignore the price checks) runs from
+        # configuration alone. fill_alpha <= 0 disables the fill-floor
+        # conditions rather than making them always true, and require_eta
+        # off skips the ETA estimate entirely.
+        self._deadline_s = float(deadline_s)
+        self._fill_alpha = float(fill_alpha)
+        self._coalesce_min = int(coalesce_min)
+        self._require_eta = bool(require_eta)
         # Retain per-request release reasons for the diagnostics recorder.
         # Off by default so the non-instrumented path keeps no extra state:
         # an unreported request would otherwise retain its decision forever.
@@ -192,7 +207,7 @@ class AdmissionCoalescer:
                     self._log_calls,
                     self._log_holds,
                     ewma,
-                    int(_DEADLINE_S * 1000),
+                    int(self._deadline_s * 1000),
                     reasons,
                 )
         for request_id in ready - reported:
@@ -259,7 +274,7 @@ class AdmissionCoalescer:
             "bucket_ewma_ms": -1.0,
             "eta_min_ms": -1.0,
             "deadline_left_ms": -1.0,
-            "fill_floor": _FILL_ALPHA * self._budget,
+            "fill_floor": self._fill_alpha * self._budget,
         }
         if not self._enabled:
             return ready, REASON_NOT_HELD_SHAPE, ctx
@@ -269,7 +284,7 @@ class AdmissionCoalescer:
         # tails on one step boundary, so waiting for a third buys no extra
         # saving while costing its whole wait in TTFT. _K stays as an upper
         # bound on how many a single step can absorb, not as a target to reach.
-        if not 0 < len(ready) < _COALESCE_MIN:
+        if not 0 < len(ready) < self._coalesce_min:
             reason = REASON_NOT_HELD_SHAPE if not ready else REASON_K_REACHED
             return ready, reason, ctx
         inflight = pending - ready
@@ -280,24 +295,29 @@ class AdmissionCoalescer:
         # A ready request whose tail alone fills a step gains nothing
         # from waiting: a sibling cannot join an already-full step. And
         # if even all ready + in-flight tails together cannot fill a
-        # step, waiting cannot produce a full step either.
-        fill_floor = _FILL_ALPHA * self._budget
+        # step, waiting cannot produce a full step either. fill_alpha
+        # <= 0 disables both checks (upper-bound experiment).
+        fill_floor = self._fill_alpha * self._budget
         tails = self._tail
-        if any(tails.get(r, 0) >= fill_floor for r in ready):
-            ctx["max_ready_tail"] = max(tails.get(r, 0) for r in ready)
-            return ready, REASON_TAIL_FILLS_STEP, ctx
-        cohort = ready | inflight
-        cohort_sum = sum(tails.get(r, 0) for r in cohort)
-        ctx["cohort_tail_sum"] = cohort_sum
-        if cohort_sum < fill_floor:
-            return ready, REASON_COHORT_TOO_SMALL, ctx
+        if fill_floor > 0:
+            if any(tails.get(r, 0) >= fill_floor for r in ready):
+                ctx["max_ready_tail"] = max(tails.get(r, 0) for r in ready)
+                return ready, REASON_TAIL_FILLS_STEP, ctx
+            cohort = ready | inflight
+            cohort_sum = sum(tails.get(r, 0) for r in cohort)
+            ctx["cohort_tail_sum"] = cohort_sum
+            if cohort_sum < fill_floor:
+                return ready, REASON_COHORT_TOO_SMALL, ctx
 
         now = time.monotonic()
         oldest_submit = min(self._submit_ts.get(r, 0.0) for r in ready)
-        deadline_left = _DEADLINE_S - (now - oldest_submit)
+        deadline_left = self._deadline_s - (now - oldest_submit)
         ctx["deadline_left_ms"] = deadline_left * 1000.0
         if deadline_left <= 0:
             return ready, REASON_DEADLINE_EXPIRED, ctx
+
+        if not self._require_eta:
+            return set(), REASON_HELD, ctx
 
         # Hold only while the earliest in-flight sibling is estimated to
         # finish before the deadline: its remaining time is the typical

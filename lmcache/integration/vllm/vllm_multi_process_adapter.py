@@ -82,6 +82,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Sentinel distinguishing "result never read" from a falsy memoized result
+# in ``_poll_transfer``.
+_POLL_RESULT_UNSET = object()
+
+
 # Export through vLLM's multiprocess Prometheus registry, independently of drains.
 _KV_EVENTS_BUFFERED = Gauge(
     "vllm:lmcache_mp_kv_events_buffered",
@@ -162,6 +167,15 @@ class ExtraConfigDefault(enum.Enum):
     # changes no scheduling decision. Default off. Also settable through the
     # LMCACHE_MP_ADM_DIAG environment variable.
     admit_diagnostics = False
+    # Price knobs for the admission-coalescing gate. The defaults reproduce
+    # the shipped constants exactly; non-default values exist so offline
+    # experiments (e.g. the hold-cost upper bound: deadline 30, fill_alpha 0,
+    # require_eta false) run from configuration alone. fill_alpha <= 0
+    # disables the fill-floor conditions rather than making them always true.
+    admit_coalesce_deadline_s = 3.0
+    admit_coalesce_fill_alpha = 0.75
+    admit_coalesce_min = 2
+    admit_coalesce_require_eta = True
     # Whether IPC mechanisms must work across isolated containers (no
     # shared host IPC namespace or /dev/shm); see
     # lmcache.v1.platform.ipc_policy. Must match the LMCache server's
@@ -391,7 +405,20 @@ def _poll_transfer(request_id: str, future: Any) -> tuple[bool, Any]:
     try:
         if not future.query():
             return False, None
-        return True, future.result(timeout=60)
+        # A held retrieve is re-polled on every engine step until the gate
+        # releases it. Each result() call re-synchronizes the device event,
+        # and on NPU that synchronize blocks on the stream -- so re-reading a
+        # completed future can stall the engine step that polls it. Read the
+        # result once and memoize it; the value is immutable afterwards.
+        memo = getattr(future, "_mp_poll_result", _POLL_RESULT_UNSET)
+        if memo is not _POLL_RESULT_UNSET:
+            return True, memo
+        result = future.result(timeout=60)
+        try:
+            future._mp_poll_result = result
+        except AttributeError:
+            pass
+        return True, result
     except REQUEST_FAILURES as exc:
         logger.warning("Transfer failed for %s: %s", request_id, exc)
         return True, False
@@ -1174,9 +1201,17 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = cfg[ExtraConfigDefault.mp_transfer_mode.name]
             else:
                 self._mp_transfer_mode = None
-            # Hold-K admission coalescing: one switch; K fixed at 3.
+            # Hold-K admission coalescing: one switch; the price knobs
+            # default to the shipped constants and are overridden only
+            # when the user sets them in extra_config.
             admit_coalesce = cfg[ExtraConfigDefault.admit_coalesce.name]
             admit_diagnostics = cfg[ExtraConfigDefault.admit_diagnostics.name]
+            gate_kwargs: dict[str, Any] = {
+                "deadline_s": cfg[ExtraConfigDefault.admit_coalesce_deadline_s.name],
+                "fill_alpha": cfg[ExtraConfigDefault.admit_coalesce_fill_alpha.name],
+                "coalesce_min": cfg[ExtraConfigDefault.admit_coalesce_min.name],
+                "require_eta": cfg[ExtraConfigDefault.admit_coalesce_require_eta.name],
+            }
             set_ipc_policy(
                 isolated_ipc=cfg[ExtraConfigDefault.isolated_ipc.name],
                 use_vmm_api=cfg[ExtraConfigDefault.use_vmm_api.name],
@@ -1185,10 +1220,12 @@ class LMCacheMPWorkerAdapter:
             self._mp_transfer_mode = None
             admit_coalesce = ExtraConfigDefault.admit_coalesce.default
             admit_diagnostics = ExtraConfigDefault.admit_diagnostics.default
+            gate_kwargs = {}
         self._coalescer = AdmissionCoalescer(
             enabled=bool(admit_coalesce),
             budget_tokens=admit_coalesce_budget,
             record_decisions=bool(admit_diagnostics) or diagnostics_enabled_from_env(),
+            **gate_kwargs,
         )
         # Diagnostics are independent of the coalescing switch: they must work
         # on the OFF arm too, otherwise there is no baseline to compare the
