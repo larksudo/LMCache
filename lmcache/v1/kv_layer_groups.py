@@ -368,10 +368,13 @@ class KVLayerGroupsManager:
         # Import here to break a circular import via
         # External connectors may import metadata while this module initializes.
         # First Party
+        # make_page_buffer_shape_desc comes from lmcache.v1.common.utils so
+        # the LMCache-Ascend plane-geometry patch (which rebinds it there)
+        # applies.
+        from lmcache.v1.common.utils import make_page_buffer_shape_desc
         from lmcache.v1.gpu_connector.utils import (
             get_num_blocks,
             log_kv_layout,
-            make_page_buffer_shape_desc,
         )
         from lmcache.v1.multiprocess.group_view import get_engine_group_indices
 

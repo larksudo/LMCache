@@ -443,6 +443,9 @@ def gather_paged_kv_to_cpu(
             of gathered chunks.
     """
     # First Party
+    # make_page_buffer_shape_desc comes from lmcache.v1.common.utils so the
+    # LMCache-Ascend plane-geometry patch (which rebinds it there) applies.
+    from lmcache.v1.common.utils import make_page_buffer_shape_desc
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         get_device,
@@ -452,7 +455,6 @@ def gather_paged_kv_to_cpu(
         get_num_blocks,
         get_num_heads,
         get_num_layers,
-        make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
         resolve_block_stride_and_log_layout,
     )
@@ -638,12 +640,14 @@ def scatter_cpu_to_paged_kv(
             a positive multiple of the physical slots per block.
     """
     # First Party
+    # make_page_buffer_shape_desc comes from lmcache.v1.common.utils so the
+    # LMCache-Ascend plane-geometry patch (which rebinds it there) applies.
+    from lmcache.v1.common.utils import make_page_buffer_shape_desc
     from lmcache.v1.gpu_connector.utils import (
         get_block_size,
         get_device,
         get_num_blocks,
         get_num_layers,
-        make_page_buffer_shape_desc,
         normalize_kv_and_discover_format,
         resolve_block_stride_and_log_layout,
     )
