@@ -37,6 +37,21 @@ _DURATION_BUCKETS: tuple[int, ...] = (8, 10, 12, 14, 16)
 _EWMA_ALPHA: float = 0.2
 
 
+# Release reasons. Recorded per request so the diagnostics recorder can report
+# *which* condition let a retrieve through. Without this, "the mechanism did
+# nothing" is indistinguishable from "the mechanism did the wrong thing".
+REASON_K_REACHED = "K_REACHED"
+REASON_NOT_HELD_SHAPE = "NOT_HELD_SHAPE"
+REASON_NO_SIBLING = "NO_SIBLING"
+REASON_TAIL_FILLS_STEP = "TAIL_FILLS_STEP"
+REASON_COHORT_TOO_SMALL = "COHORT_TOO_SMALL"
+REASON_DEADLINE_EXPIRED = "DEADLINE_EXPIRED"
+REASON_NO_ETA = "NO_ETA"
+REASON_ETA_TOO_LATE = "ETA_TOO_LATE"
+REASON_HELD = "HELD"
+REASON_EMPTY_PENDING = "EMPTY_PENDING"
+
+
 def _bucket_for(tail_tokens: int) -> int:
     """Return the nearest bucket key in log2(tail_tokens) space."""
     if tail_tokens <= 0:
@@ -54,9 +69,18 @@ class AdmissionCoalescer:
     when the request is reported or drained.
     """
 
-    def __init__(self, enabled: bool, budget_tokens: int) -> None:
+    def __init__(
+        self,
+        enabled: bool,
+        budget_tokens: int,
+        record_decisions: bool = False,
+    ) -> None:
         self._enabled = enabled
         self._budget = budget_tokens
+        # Retain per-request release reasons for the diagnostics recorder.
+        # Off by default so the non-instrumented path keeps no extra state:
+        # an unreported request would otherwise retain its decision forever.
+        self._record_decisions = bool(record_decisions)
         # request_id -> retrieve submission timestamp.
         self._submit_ts: dict[str, float] = {}
         # request_id -> prefill tail in tokens.
@@ -65,6 +89,13 @@ class AdmissionCoalescer:
         self._bucket_ewma: dict[int, float | None] = dict.fromkeys(_DURATION_BUCKETS)
         self._log_calls = 0
         self._log_holds = 0
+        # request_id -> (release reason, decision context), set when the id
+        # becomes ready and cleared when it is reported. Bounded by the
+        # number of in-flight retrieves.
+        self._decisions: dict[str, tuple[str, dict[str, object]]] = {}
+        self._reason_counts: dict[str, int] = {}
+        self._last_reason: str = REASON_NOT_HELD_SHAPE
+        self._last_ctx: dict[str, object] = {}
         # request_id -> timestamp of the first hold decision, used to
         # subtract hold time from duration samples so the EWMA tracks
         # the retrieve pipeline rather than our own waiting.
@@ -98,12 +129,14 @@ class AdmissionCoalescer:
             self._submit_ts.pop(request_id, None)
             self._tail.pop(request_id, None)
             self._first_hold.pop(request_id, None)
+            self._decisions.pop(request_id, None)
 
     def drain(self) -> None:
         """Drop all per-request state (unhealthy path reports everything)."""
         self._submit_ts.clear()
         self._tail.clear()
         self._first_hold.clear()
+        self._decisions.clear()
 
     def select_to_report(self, ready: set[str], pending: set[str]) -> set[str]:
         """Return the subset of *ready* to report this engine step.
@@ -121,10 +154,20 @@ class AdmissionCoalescer:
         """
         if not self._enabled:
             return ready
-        reported = self._hold(ready, pending)
+        reported, reason, ctx = self._hold(ready, pending)
         now = time.monotonic()
         if len(ready) > len(reported):
             self._log_holds += len(ready) - len(reported)
+        self._last_reason = reason
+        self._last_ctx = ctx
+        self._reason_counts[reason] = self._reason_counts.get(reason, 0) + 1
+        # Remember why each newly-ready request was released (or that it is
+        # being held), so the diagnostics recorder can attribute the decision
+        # at report time rather than guessing from counters. Skipped entirely
+        # when nothing will read them.
+        if self._record_decisions:
+            for request_id in ready:
+                self._decisions[request_id] = (reason, dict(ctx))
         if _LOG_EVERY and self._enabled:
             self._log_calls += 1
             if self._log_calls % _LOG_EVERY == 0:
@@ -136,12 +179,17 @@ class AdmissionCoalescer:
                     )
                     or "n/a"
                 )
+                reasons = " ".join(
+                    f"{k}={v}" for k, v in sorted(self._reason_counts.items())
+                )
                 logger.info(
-                    "admit_coalesce: calls=%d holds=%d ewma[%s] deadline_ms=%d",
+                    "admit_coalesce: calls=%d holds=%d ewma[%s] deadline_ms=%d "
+                    "reasons[%s]",
                     self._log_calls,
                     self._log_holds,
                     ewma,
                     int(_DEADLINE_S * 1000),
+                    reasons,
                 )
         for request_id in ready - reported:
             self._first_hold.setdefault(request_id, now)
@@ -150,7 +198,28 @@ class AdmissionCoalescer:
             self._submit_ts.pop(request_id, None)
             self._tail.pop(request_id, None)
             self._first_hold.pop(request_id, None)
+            # NOTE: _decisions is deliberately NOT popped here. The adapter
+            # reads the reason after this call returns (take_decision), and a
+            # pop here would leave it with nothing to attribute. Entries are
+            # reclaimed by take_decision, forget, or drain.
         return reported
+
+    def take_decision(self, request_id: str) -> tuple[str, dict[str, object]]:
+        """Return and forget the recorded release reason for *request_id*.
+
+        Called by the diagnostics recorder at report time. Missing entries
+        yield a benign default so a caller can never fail on a request the
+        gate never saw (for example one dropped while unhealthy, or when
+        ``record_decisions`` is off).
+        """
+        if not self._decisions:
+            return REASON_NOT_HELD_SHAPE, {}
+        reason, ctx = self._decisions.pop(request_id, (REASON_NOT_HELD_SHAPE, {}))
+        return reason, ctx
+
+    def peek_decision(self, request_id: str) -> tuple[str, dict[str, object]]:
+        """Return the recorded release reason without forgetting it."""
+        return self._decisions.get(request_id, (REASON_NOT_HELD_SHAPE, {}))
 
     def _estimate_duration(self, tail_tokens: int) -> float | None:
         """Return the bucket EWMA for this tail length, or None.
@@ -160,7 +229,9 @@ class AdmissionCoalescer:
         """
         return self._bucket_ewma.get(_bucket_for(tail_tokens))
 
-    def _hold(self, ready: set[str], pending: set[str]) -> set[str]:
+    def _hold(
+        self, ready: set[str], pending: set[str]
+    ) -> tuple[set[str], str, dict[str, object]]:
         """Hold completed retrieves for one step so that several prefill
         tails are admitted on the same step boundary.
 
@@ -168,14 +239,37 @@ class AdmissionCoalescer:
         ready, no sibling retrieve in flight, a ready tail alone fills a
         step, the deadline (from submit) expired, or the earliest
         in-flight sibling is estimated to arrive after it.
+
+        Returns:
+            A 3-tuple ``(to_report, reason, context)``. ``reason`` names the
+            first condition that stopped holding; ``context`` carries the
+            numbers that condition compared. Together they let an offline
+            analysis attribute every release instead of inferring it, which
+            is what makes "the gate never fired" distinguishable from "the
+            gate fired on the wrong requests".
         """
-        if not self._enabled or not pending:
-            return ready
+        ctx: dict[str, object] = {
+            "n_ready": len(ready),
+            "n_pending": len(pending),
+            "n_inflight": 0,
+            "bucket_ewma_ms": -1.0,
+            "eta_min_ms": -1.0,
+            "deadline_left_ms": -1.0,
+            "fill_floor": _FILL_ALPHA * self._budget,
+        }
+        if not self._enabled:
+            return ready, REASON_NOT_HELD_SHAPE, ctx
+        if not pending:
+            return ready, REASON_EMPTY_PENDING, ctx
         if not 0 < len(ready) < _K:
-            return ready
+            # Nothing ready, or K+ ready so the coalescing target is already
+            # met without waiting.
+            reason = REASON_NOT_HELD_SHAPE if not ready else REASON_K_REACHED
+            return ready, reason, ctx
         inflight = pending - ready
+        ctx["n_inflight"] = len(inflight)
         if not inflight:
-            return ready
+            return ready, REASON_NO_SIBLING, ctx
 
         # A ready request whose tail alone fills a step gains nothing
         # from waiting: a sibling cannot join an already-full step. And
@@ -184,22 +278,27 @@ class AdmissionCoalescer:
         fill_floor = _FILL_ALPHA * self._budget
         tails = self._tail
         if any(tails.get(r, 0) >= fill_floor for r in ready):
-            return ready
+            ctx["max_ready_tail"] = max(tails.get(r, 0) for r in ready)
+            return ready, REASON_TAIL_FILLS_STEP, ctx
         cohort = ready | inflight
-        if sum(tails.get(r, 0) for r in cohort) < fill_floor:
-            return ready
+        cohort_sum = sum(tails.get(r, 0) for r in cohort)
+        ctx["cohort_tail_sum"] = cohort_sum
+        if cohort_sum < fill_floor:
+            return ready, REASON_COHORT_TOO_SMALL, ctx
 
         now = time.monotonic()
         oldest_submit = min(self._submit_ts.get(r, 0.0) for r in ready)
         deadline_left = _DEADLINE_S - (now - oldest_submit)
+        ctx["deadline_left_ms"] = deadline_left * 1000.0
         if deadline_left <= 0:
-            return ready
+            return ready, REASON_DEADLINE_EXPIRED, ctx
 
         # Hold only while the earliest in-flight sibling is estimated to
         # finish before the deadline: its remaining time is the typical
         # retrieve duration for ITS tail length minus how long it has
         # already waited. Without an estimate for that length, release.
         eta_min = None
+        ewma_used = None
         for r in inflight:
             est = self._estimate_duration(tails.get(r, 0))
             if est is None:
@@ -208,10 +307,16 @@ class AdmissionCoalescer:
             eta = max(0.0, est - waited)
             if eta_min is None or eta < eta_min:
                 eta_min = eta
+                ewma_used = est
+        if ewma_used is not None:
+            ctx["bucket_ewma_ms"] = ewma_used * 1000.0
+        if eta_min is not None:
+            ctx["eta_min_ms"] = eta_min * 1000.0
         if eta_min is None or eta_min > deadline_left:
-            return ready
+            reason = REASON_NO_ETA if eta_min is None else REASON_ETA_TOO_LATE
+            return ready, reason, ctx
 
-        return set()
+        return set(), REASON_HELD, ctx
 
     def _note_durations(self, reported: set[str]) -> None:
         """Update the per-bucket duration EWMA from reported requests.

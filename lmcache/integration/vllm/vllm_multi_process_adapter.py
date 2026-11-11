@@ -21,6 +21,12 @@ from lmcache.integration.request_telemetry.factory import RequestTelemetryFactor
 from lmcache.integration.vllm.admission_coalescing import (
     DEFAULT_BUDGET_TOKENS,
     AdmissionCoalescer,
+    _bucket_for,
+)
+from lmcache.integration.vllm.admission_diagnostics import (
+    AdmissionDiagnostics,
+    StepRecord,
+    diagnostics_enabled_from_env,
 )
 from lmcache.integration.vllm.experimental import dispatch
 from lmcache.integration.vllm.mp_lookup_state import LookupState
@@ -150,6 +156,12 @@ class ExtraConfigDefault(enum.Enum):
     # are admitted on the same step boundary and the per-step token
     # budget is filled. Default off.
     admit_coalesce = False
+    # Log per-retrieve and per-step observations used to audit the admission
+    # coalescing gate (measured retrieve duration vs the gate's ETA estimate,
+    # release-reason attribution, per-rank spread). Observation only: it
+    # changes no scheduling decision. Default off. Also settable through the
+    # LMCACHE_MP_ADM_DIAG environment variable.
+    admit_diagnostics = False
     # Whether IPC mechanisms must work across isolated containers (no
     # shared host IPC namespace or /dev/shm); see
     # lmcache.v1.platform.ipc_policy. Must match the LMCache server's
@@ -1164,6 +1176,7 @@ class LMCacheMPWorkerAdapter:
                 self._mp_transfer_mode = None
             # Hold-K admission coalescing: one switch; K fixed at 3.
             admit_coalesce = cfg[ExtraConfigDefault.admit_coalesce.name]
+            admit_diagnostics = cfg[ExtraConfigDefault.admit_diagnostics.name]
             set_ipc_policy(
                 isolated_ipc=cfg[ExtraConfigDefault.isolated_ipc.name],
                 use_vmm_api=cfg[ExtraConfigDefault.use_vmm_api.name],
@@ -1171,10 +1184,28 @@ class LMCacheMPWorkerAdapter:
         else:
             self._mp_transfer_mode = None
             admit_coalesce = ExtraConfigDefault.admit_coalesce.default
+            admit_diagnostics = ExtraConfigDefault.admit_diagnostics.default
         self._coalescer = AdmissionCoalescer(
             enabled=bool(admit_coalesce),
             budget_tokens=admit_coalesce_budget,
+            record_decisions=bool(admit_diagnostics) or diagnostics_enabled_from_env(),
         )
+        # Diagnostics are independent of the coalescing switch: they must work
+        # on the OFF arm too, otherwise there is no baseline to compare the
+        # gate's estimates against. Enabled by extra_config or by env var so a
+        # running deployment can be instrumented without editing vLLM config.
+        self._diag = AdmissionDiagnostics(
+            enabled=bool(admit_diagnostics) or diagnostics_enabled_from_env(),
+            # vLLM worker id, NOT the kv rank: distinguishing ranks of the same
+            # scheduler group is the whole point of the per-rank spread check.
+            rank=parallel_strategy.vllm_worker_id,
+        )
+        # Step pacing. ``get_finished`` is called once per engine step, so the
+        # interval between consecutive calls approximates step wall time. That
+        # plus how many requests this step admitted is the input to pricing
+        # ``c0`` (what one more admission on an existing step actually costs),
+        # which is the number every coalescing claim is ultimately priced by.
+        self._diag_last_step_ts = 0.0
         self.req_client = RequestClientFactory.create(server_url, context=context)
         self._mq_timeout = mq_timeout
         self._server_url = server_url
@@ -1832,9 +1863,23 @@ class LMCacheMPWorkerAdapter:
             skip_first_n_tokens=op.skip_first_n_tokens,
         )
         self.retrieve_futures[request_id] = (future, op.flat_block_ids)
-        self._coalescer.on_submit(
-            request_id, max(0, num_packed_tokens(op.token_bytes) - op.end)
-        )
+        prompt_tokens = num_packed_tokens(op.token_bytes)
+        tail_tokens = max(0, prompt_tokens - op.end)
+        self._coalescer.on_submit(request_id, tail_tokens)
+        # Diagnostics need the HIT size as well: GetRetrieveMetadata retrieves
+        # the range [num_vllm_hit_tokens, num_lmcache_hit_tokens), so the
+        # transferred volume is op.end - op.start, while tail_tokens is what
+        # still has to be recomputed. The gate buckets its duration EWMA on
+        # the tail, so recording both is what makes the bucketing error
+        # measurable (AgentX: hit 140k..676k vs tail 1.4k..6.8k).
+        if self._diag.enabled:
+            self._diag.on_submit(
+                request_id,
+                tail_tokens=tail_tokens,
+                hit_tokens=max(0, op.end - op.start),
+                prompt_tokens=prompt_tokens,
+                bucket=_bucket_for(tail_tokens),
+            )
         if event is not None:
             self.retrieve_events[request_id] = event
 
@@ -1955,6 +2000,96 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def _record_step(
+        self,
+        coalescer: "AdmissionCoalescer",
+        admitted: set[str],
+    ) -> None:
+        """Emit one step observation for pricing ``c0`` and saturation.
+
+        Only worker-visible quantities are recorded. ``prefill_tokens``,
+        ``decode_tokens``, ``num_running`` and ``num_waiting`` live on the
+        scheduler side and stay at their ``-1`` sentinel until the gate moves
+        there; their absence is explicit in the record rather than guessed.
+        """
+        try:
+            now = time.monotonic()
+            prev = self._diag_last_step_ts
+            self._diag_last_step_ts = now
+            if prev <= 0.0:
+                return  # first call has no interval to measure
+            # Tails of the requests admitted *this* step are already popped
+            # from the coalescer by select_to_report, so read what the
+            # diagnostics recorder still holds instead.
+            admitted_tails = 0
+            for rid in admitted:
+                rec = self._diag._open.get(rid)
+                if rec is not None:
+                    admitted_tails += rec.tail_tokens
+            step_id = self._diag.next_step_id()
+            self._diag.on_step(
+                StepRecord(
+                    step_id=step_id,
+                    rank=0,  # on_step stamps the recorder's own rank
+                    step_start=prev,
+                    step_end=now,
+                    admitted_now=len(admitted),
+                    admitted_tails=admitted_tails,
+                    token_budget=coalescer._budget,
+                )
+            )
+        except Exception:
+            logger.debug("ADM_DIAG step recording failed", exc_info=True)
+
+    def _stamp_completions(
+        self,
+        coalescer: "AdmissionCoalescer",
+        newly_done: list[str],
+        ready_set: set[str],
+        inflight_before: int,
+    ) -> None:
+        """Record completion time plus the gate's decision context.
+
+        Called *before* ``select_to_report`` so the stamped ``d_ms`` measures
+        the retrieve pipeline alone, excluding any hold the gate then adds.
+        The reason is read from the gate's previous evaluation when the id was
+        already known, and is refreshed by ``_stamp_reports`` afterwards.
+        """
+        try:
+            n_ready = len(ready_set)
+            n_inflight = max(0, inflight_before - n_ready)
+            for request_id in newly_done:
+                reason, ctx = coalescer.peek_decision(request_id)
+                self._diag.on_complete(
+                    request_id,
+                    reason=reason,
+                    bucket_ewma_ms=float(ctx.get("bucket_ewma_ms", -1.0)),
+                    eta_min_ms=float(ctx.get("eta_min_ms", -1.0)),
+                    deadline_left_ms=float(ctx.get("deadline_left_ms", -1.0)),
+                    n_inflight=n_inflight,
+                    n_ready=n_ready,
+                )
+        except Exception:
+            # Diagnostics must never break the engine path.
+            logger.debug("ADM_DIAG completion stamping failed", exc_info=True)
+
+    def _stamp_reports(
+        self,
+        coalescer: "AdmissionCoalescer",
+        reported: set[str],
+    ) -> None:
+        """Close the record for each retrieve reported to vLLM this step.
+
+        ``hold_ms`` is derived here as report time minus completion time, so
+        it isolates exactly what the gate added on top of the transfer.
+        """
+        try:
+            for request_id in reported:
+                reason, _ctx = coalescer.take_decision(request_id)
+                self._diag.on_report(request_id, reason=reason)
+        except Exception:
+            logger.debug("ADM_DIAG report stamping failed", exc_info=True)
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -2042,12 +2177,23 @@ class LMCacheMPWorkerAdapter:
             else:
                 self._publish_store_kv_events(request_id)
 
+        # Snapshot the in-flight set BEFORE this pass mutates it, so the
+        # diagnostics can report how many siblings were concurrent when each
+        # retrieve completed. That count is the quantity the coalescing gate
+        # needs but never observes directly: it is what decides whether a
+        # sibling could possibly have arrived inside the hold window.
+        _diag_on = self._diag.enabled
+        _inflight_before = len(self.retrieve_futures) if _diag_on else 0
+        _newly_done: list[str] = []
+
         for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             done, r_result = _poll_transfer(request_id, r_future)
             if not done:
                 continue
 
             finished_retrieves.add(request_id)
+            if _diag_on:
+                _newly_done.append(request_id)
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
@@ -2073,9 +2219,22 @@ class LMCacheMPWorkerAdapter:
             _stale = set(_coalescer._submit_ts) - set(self.retrieve_futures)
             if _stale:
                 _coalescer.forget(_stale)
+                if _diag_on:
+                    # Preempted/cancelled retrieves leave tracking without a
+                    # report; drop their diagnostic records too or the open
+                    # dict grows for the lifetime of the worker process.
+                    self._diag.on_drop(_stale)
+            _ready_set = set(finished_retrieves)
+            if _diag_on:
+                self._stamp_completions(
+                    _coalescer, _newly_done, _ready_set, _inflight_before
+                )
             finished_retrieves = _coalescer.select_to_report(
                 finished_retrieves, set(self.retrieve_futures)
             )
+            if _diag_on:
+                self._stamp_reports(_coalescer, finished_retrieves)
+                self._record_step(_coalescer, finished_retrieves)
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
@@ -2196,12 +2355,23 @@ class LMCacheMPWorkerAdapter:
             else:
                 self._publish_store_kv_events(request_id)
 
+        # Snapshot the in-flight set BEFORE this pass mutates it, so the
+        # diagnostics can report how many siblings were concurrent when each
+        # retrieve completed. That count is the quantity the coalescing gate
+        # needs but never observes directly: it is what decides whether a
+        # sibling could possibly have arrived inside the hold window.
+        _diag_on = self._diag.enabled
+        _inflight_before = len(self.retrieve_futures) if _diag_on else 0
+        _newly_done: list[str] = []
+
         for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
             done, r_result = _poll_transfer(request_id, r_future)
             if not done:
                 continue
 
             finished_retrieves.add(request_id)
+            if _diag_on:
+                _newly_done.append(request_id)
 
             if not r_result:
                 self.error_block_ids.update(r_block_ids)
@@ -2220,9 +2390,19 @@ class LMCacheMPWorkerAdapter:
             _stale = set(_coalescer._submit_ts) - set(self.retrieve_futures)
             if _stale:
                 _coalescer.forget(_stale)
+                if _diag_on:
+                    self._diag.on_drop(_stale)
+            _ready_set = set(finished_retrieves)
+            if _diag_on:
+                self._stamp_completions(
+                    _coalescer, _newly_done, _ready_set, _inflight_before
+                )
             finished_retrieves = _coalescer.select_to_report(
                 finished_retrieves, set(self.retrieve_futures)
             )
+            if _diag_on:
+                self._stamp_reports(_coalescer, finished_retrieves)
+                self._record_step(_coalescer, finished_retrieves)
 
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
