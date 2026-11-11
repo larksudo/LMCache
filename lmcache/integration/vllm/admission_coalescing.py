@@ -27,7 +27,11 @@ DEFAULT_BUDGET_TOKENS: int = 8192
 _DEADLINE_S: float = 3.0
 # Fraction of the step budget that counts as a full step.
 _FILL_ALPHA: float = 0.75
-# Number of ready retrieves to coalesce.
+# Minimum ready retrieves that make a hold worthwhile: two tails on one step
+# boundary already realise the merge, so a third adds cost without benefit.
+_COALESCE_MIN: int = 2
+# Upper bound on how many ready retrieves a single step can absorb. Reaching it
+# releases immediately rather than waiting for more.
 _K: int = 3
 # Log a decision summary every N gate calls (0 = never).
 _LOG_EVERY: int = 200
@@ -261,9 +265,11 @@ class AdmissionCoalescer:
             return ready, REASON_NOT_HELD_SHAPE, ctx
         if not pending:
             return ready, REASON_EMPTY_PENDING, ctx
-        if not 0 < len(ready) < _K:
-            # Nothing ready, or K+ ready so the coalescing target is already
-            # met without waiting.
+        # Release as soon as two are ready. A merge needs exactly two prefill
+        # tails on one step boundary, so waiting for a third buys no extra
+        # saving while costing its whole wait in TTFT. _K stays as an upper
+        # bound on how many a single step can absorb, not as a target to reach.
+        if not 0 < len(ready) < _COALESCE_MIN:
             reason = REASON_NOT_HELD_SHAPE if not ready else REASON_K_REACHED
             return ready, reason, ctx
         inflight = pending - ready

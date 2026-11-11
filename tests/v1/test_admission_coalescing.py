@@ -246,3 +246,48 @@ def test_bucket_cold_start_releases():
     c.on_submit("b", 30000)  # different bucket
     # No duration observations at all
     assert c.select_to_report({"a"}, {"a", "b"}) == {"a"}
+
+
+def test_two_ready_releases_without_waiting_for_a_third():
+    """M2: two ready tails already realise a merge; a third adds no saving.
+
+    Regression guard. The gate used ``0 < len(ready) < _K`` with ``_K = 3``, so
+    two ready retrieves kept holding for a third or for the deadline. Both
+    tails already land on one step boundary at two, so the extra wait was pure
+    TTFT cost with no throughput benefit -- and on a saturated agentic workload
+    that cost is what shows up as the TTFT regression.
+    """
+    c = _make(enabled=True)
+    # Seed the duration EWMA so the ETA condition can hold rather than
+    # releasing for lack of an estimate.
+    c.on_submit("seed", TWO_TAILS)
+    c.select_to_report({"seed"}, {"seed"})
+
+    c.on_submit("a", TWO_TAILS)
+    c.on_submit("b", TWO_TAILS)
+    c.on_submit("c", TWO_TAILS)  # a third sibling is in flight
+    # Both a and b are ready: release now, do not wait for c.
+    assert c.select_to_report({"a", "b"}, {"a", "b", "c"}) == {"a", "b"}
+
+
+def test_one_ready_still_holds_when_a_sibling_can_arrive():
+    """The M2 change must not disable holding entirely: one ready still waits."""
+    c = _make(enabled=True)
+    c.on_submit("seed", TWO_TAILS)
+    c.select_to_report({"seed"}, {"seed"})
+
+    c.on_submit("a", TWO_TAILS)
+    c.on_submit("b", TWO_TAILS)
+    # Only "a" is ready and "b" is still in flight -> holding can pay off.
+    assert c.select_to_report({"a"}, {"a", "b"}) == set()
+    assert c.select_to_report({"a", "b"}, {"a", "b"}) == {"a", "b"}
+
+
+def test_k_reached_still_releases():
+    """_K remains an upper bound: reaching it releases immediately."""
+    c = _make(enabled=True)
+    c.on_submit("seed", TWO_TAILS)
+    c.select_to_report({"seed"}, {"seed"})
+    for rid in ("a", "b", "c"):
+        c.on_submit(rid, TWO_TAILS)
+    assert c.select_to_report({"a", "b", "c"}, {"a", "b", "c"}) == {"a", "b", "c"}

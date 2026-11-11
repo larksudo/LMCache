@@ -9,7 +9,12 @@ import time
 import pytest
 
 # First Party
-from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
+from lmcache.v1.multiprocess.affinity_pool import (
+    AffinityThreadPool,
+    current_queue_depth,
+    current_queue_wait_ms,
+    current_slot,
+)
 
 
 def test_submit_returns_correct_result():
@@ -246,3 +251,82 @@ def test_shutdown_no_wait():
     pool.submit(lambda: time.sleep(0.5), affinity_key=0)
     # Should return immediately without waiting
     pool.shutdown(wait=False)
+
+
+def test_future_carries_queue_timing():
+    """The future exposes the wait it actually incurred, plus its slot."""
+    pool = AffinityThreadPool(max_workers=2)
+    f = pool.submit(lambda: None, affinity_key=0)
+    f.result(timeout=5)
+    wait = getattr(f, "queue_wait_ms", None)
+    assert wait is not None, "future must carry queue_wait_ms after running"
+    assert wait >= 0.0
+    assert isinstance(getattr(f, "queue_depth", None), int)
+    assert isinstance(getattr(f, "slot", None), int)
+    pool.shutdown()
+
+
+def test_queued_behind_a_blocker_reports_a_real_wait():
+    """A task queued behind a running one measures that wait (the whole point).
+
+    ``queue_depth`` is the queue length *at enqueue time*, so it grows for
+    later arrivals; the wait itself is bounded below by how long the blocker
+    held the single worker.
+    """
+    pool = AffinityThreadPool(max_workers=1)
+    gate = threading.Event()
+    blocker = pool.submit(lambda: gate.wait(5.0), affinity_key=0)
+    # Let the worker actually pick the blocker up before queueing behind it.
+    while getattr(blocker, "queue_wait_ms", None) is None:
+        time.sleep(0.005)
+    queued = pool.submit(lambda: None, affinity_key=0)
+    time.sleep(0.05)
+    gate.set()
+    blocker.result(timeout=10)
+    queued.result(timeout=10)
+    assert queued.queue_wait_ms >= 40.0, queued.queue_wait_ms
+    assert queued.queue_depth == 0, "nothing else was queued ahead of it"
+    pool.shutdown()
+
+
+def test_thread_locals_visible_inside_handler_only():
+    """Accessors report the current task inside a worker, sentinel outside."""
+    pool = AffinityThreadPool(max_workers=1)
+    seen = {}
+
+    def handler():
+        seen["wait"] = current_queue_wait_ms()
+        seen["depth"] = current_queue_depth()
+        seen["slot"] = current_slot()
+
+    pool.submit(handler, affinity_key=3).result(timeout=5)
+    assert seen["wait"] >= 0.0
+    assert seen["slot"] >= 0
+    # Outside any worker thread the sentinel distinguishes "not measured"
+    # from a genuine 0.0 wait.
+    assert current_queue_wait_ms() == -1.0
+    assert current_queue_depth() == -1
+    assert current_slot() == -1
+    pool.shutdown()
+
+
+def test_thread_locals_do_not_leak_between_tasks():
+    """A reused thread must clear the timing before the next handler runs."""
+    pool = AffinityThreadPool(max_workers=1)
+    observed = []
+
+    def handler():
+        observed.append(current_queue_wait_ms())
+
+    for _ in range(3):
+        pool.submit(handler, affinity_key=0).result(timeout=5)
+    assert len(observed) == 3
+    assert all(v >= 0.0 for v in observed), observed
+    pool.shutdown()
+
+
+def test_shutdown_sentinel_is_not_unpacked_as_a_task():
+    """The sentinel is a bare object, not a 6-tuple; unpacking it would raise."""
+    pool = AffinityThreadPool(max_workers=2)
+    pool.submit(lambda: None, affinity_key=0).result(timeout=5)
+    pool.shutdown(wait=True)  # must not raise TypeError
