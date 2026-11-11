@@ -42,6 +42,7 @@ def test_not_done_future_polls_again_without_memo():
     assert ok is False and r is None
     assert fut.result_calls == 0
     # Once it completes, the normal path runs and memoizes.
+    fut.query = lambda: True
     ok2, r2 = _poll_transfer("rid", fut)
     ok3, r3 = _poll_transfer("rid", fut)
     assert ok2 and ok3 and r2 is r3
