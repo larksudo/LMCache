@@ -126,3 +126,22 @@ def test_c0_not_estimated_without_prefill_tokens(analyzer, capsys):
     text = capsys.readouterr().out
     assert "CANNOT ESTIMATE c0" in text
     assert "NOT c0" in text
+
+
+def test_holds_are_counted_from_hold_ms_not_reason(analyzer, capsys):
+    """A request that was held then released reads K_REACHED, not HELD.
+
+    Counting reason==HELD reported zero holds for a gate that demonstrably
+    held 413 of 1224 requests in the 2026-11-12 TP8 forced arm.
+    """
+    adm = [
+        _rec(rid=f"h{i}", reason="K_REACHED", hold_ms=50.0 + i, d_ms=100.0)
+        for i in range(10)
+    ] + [
+        _rec(rid=f"n{i}", reason="NO_SIBLING", hold_ms=0.0, d_ms=100.0)
+        for i in range(90)
+    ]
+    analyzer.q4_reasons(adm)
+    text = capsys.readouterr().out
+    assert "held(hold_ms>0.5ms)=10" in text
+    assert "hold_ms: mean=" in text

@@ -389,10 +389,25 @@ def q4_reasons(adm):
     total = sum(cnt.values())
     for reason, n in cnt.most_common():
         print(f"  {reason:<20} {n:>7}  {100.0 * n / total:5.1f}%")
-    held = cnt.get("HELD", 0)
+    # The release reason recorded on the final report is the one that let the
+    # request through, so a request that WAS held and then released reads
+    # reason=K_REACHED / NO_SIBLING, never HELD. Counting reason==HELD would
+    # therefore always report zero holds for a working gate. Holds are visible
+    # in hold_ms, which is report_time - completion_time: anything above a
+    # scheduling quantum actually waited.
+    hold_ms = [r.get("hold_ms", 0.0) or 0.0 for r in adm]
+    held = sum(1 for h in hold_ms if h > 0.5)
     print(
-        f"\n  total records={total}  held={held} ({100.0 * held / max(1, total):.1f}%)"
+        f"\n  total records={total}  held(hold_ms>0.5ms)={held} "
+        f"({100.0 * held / max(1, total):.1f}%)"
     )
+    if held:
+        hs = sorted(h for h in hold_ms if h > 0.5)
+        print(
+            f"  hold_ms: mean={statistics.mean(hs):.1f} "
+            f"p50={pct(hs, 0.5):.1f} p90={pct(hs, 0.9):.1f} max={max(hs):.1f}"
+        )
+        print(f"  total hold time = {sum(hs):.0f} ms across {held} requests")
     no_sib = cnt.get("NO_SIBLING", 0)
     if total < 30:
         print(
