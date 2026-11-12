@@ -36,6 +36,20 @@ STEP_RE = re.compile(
 )
 KV_RE = re.compile(r"(\w+)=(-?[\w.\-]+)")
 
+# vLLM's own scheduler-side iteration dump (--enable-logging-iteration-details).
+# This is the ONLY place prefill/decode token counts and KV pressure are visible:
+# the worker-side STEP_DIAG records them as -1 sentinels. Sample line:
+#   Engine 000: Iteration(4): 1 context requests, 8191 context tokens, 1
+#   generation requests, 1 generation tokens, iteration elapsed time:
+#   1001.96 ms, NPU KV cache usage: 47.2%
+ITER_RE = re.compile(
+    r"Iteration\((?P<idx>\d+)\): "
+    r"(?P<ctx_req>\d+) context requests, (?P<ctx_tok>\d+) context tokens, "
+    r"(?P<gen_req>\d+) generation requests, (?P<gen_tok>\d+) generation tokens, "
+    r"iteration elapsed time: (?P<elapsed>[\d.]+) ms, "
+    r"NPU KV cache usage: (?P<kv>[\d.]+)%"
+)
+
 # ADM_DIAG fields
 INT_FIELDS = {
     "rank",
@@ -90,7 +104,7 @@ def parse_kv(text: str) -> dict:
 
 
 def load(paths):
-    adm, step = [], []
+    adm, step, it = [], [], []
     for p in paths:
         try:
             with open(p, "r", encoding="utf-8", errors="ignore") as f:
@@ -107,7 +121,19 @@ def load(paths):
             rec = parse_kv(m.group("kv"))
             rec["_file"] = p
             step.append(rec)
-    return adm, step
+        for m in ITER_RE.finditer(text):
+            it.append(
+                {
+                    "idx": int(m.group("idx")),
+                    "ctx_req": int(m.group("ctx_req")),
+                    "ctx_tok": int(m.group("ctx_tok")),
+                    "gen_req": int(m.group("gen_req")),
+                    "gen_tok": int(m.group("gen_tok")),
+                    "elapsed_ms": float(m.group("elapsed")),
+                    "kv_pct": float(m.group("kv")),
+                }
+            )
+    return adm, step, it
 
 
 def pct(values, q):
@@ -396,9 +422,103 @@ def q4_reasons(adm):
     return {"counts": cnt}
 
 
-def q5_steps(step):
+def _q5_from_iterations(it):
+    """c0 and saturation from vLLM's own iteration dump.
+
+    Each iteration reports how many context (prefill) tokens it carried, how
+    many generation requests it advanced, and how long it took. That is exactly
+    the covariate the worker-side STEP_DIAG lacks, so the prefill coefficient
+    and the fixed per-iteration intercept become estimable here.
+
+    A least-squares fit of elapsed_ms ~ 1 + ctx_tok + gen_req is small enough to
+    do without numpy: three normal equations in three unknowns.
+    """
+    durs = [r["elapsed_ms"] for r in it]
+    ctx = [r["ctx_tok"] for r in it]
+    gen = [r["gen_req"] for r in it]
+    kv = [r["kv_pct"] for r in it]
+    print(f"  iterations: {describe(durs)} ms")
+    print(f"  context tokens/iter: {describe([float(c) for c in ctx])}")
+    print(f"  prefill-carrying iterations: {sum(1 for c in ctx if c > 0)}/{len(it)}")
+    print(f"  KV usage: {describe(kv)} %")
+
+    if len({c for c in ctx}) < 3 or len(it) < 30:
+        print("  CANNOT FIT: need >=3 distinct context-token counts and n>=30.")
+        return
+
+    # d ~ b0 + b1*ctx + b2*gen  (normal equations, 3x3 solve)
+    n = len(it)
+    pts = [
+        (1.0, float(c), float(g), float(d))
+        for c, g, d in zip(ctx, gen, durs, strict=True)
+    ]
+    a = [[sum(p[i] * p[j] for p in pts) for j in range(3)] for i in range(3)]
+    b = [sum(p[i] * p[3] for p in pts) for i in range(3)]
+
+    # Gaussian elimination with partial pivoting.
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-12:
+            print("  CANNOT FIT: singular design (context/gen collinear).")
+            return
+        a[col], a[piv] = a[piv], a[col]
+        b[col], b[piv] = b[piv], b[col]
+        for r in range(col + 1, 3):
+            f = a[r][col] / a[col][col]
+            for c2 in range(col, 3):
+                a[r][c2] -= f * a[col][c2]
+            b[r] -= f * b[col]
+    coef = [0.0, 0.0, 0.0]
+    for r in (2, 1, 0):
+        acc = b[r] - sum(a[r][c] * coef[c] for c in range(r + 1, 3))
+        coef[r] = acc / a[r][r]
+
+    ybar = sum(durs) / n
+    ss_tot = sum((d - ybar) ** 2 for d in durs)
+    ss_res = sum(
+        (d - (coef[0] + coef[1] * c + coef[2] * g)) ** 2
+        for c, g, d in zip(ctx, gen, durs, strict=True)
+    )
+    r2 = 0.0 if ss_tot <= 0 else 1.0 - ss_res / ss_tot
+    print()
+    print("  least-squares: elapsed_ms ~ b0 + b1*context_tokens + b2*gen_reqs")
+    print(f"    b0 (fixed per-iteration cost) = {coef[0]:9.2f} ms")
+    print(f"    b1 (per context token)        = {coef[1]:9.4f} ms/token")
+    print(f"    b2 (per generation request)   = {coef[2]:9.2f} ms/req")
+    print(f"    R^2 = {r2:.3f}   n = {n}")
+    print()
+    print("  NOTE: b0 is the fixed cost of carrying ANY prefill on a step; it is")
+    print("    the closest measurable analogue of c0, but it is not identical --")
+    print("    c0 is the marginal cost of admitting one more request on an")
+    print("    existing step. Use b0 as the order-of-magnitude bound and say so.")
+
+    busy = sum(d for d, c in zip(durs, ctx, strict=True) if c > 0)
+    print()
+    print(
+        f"  prefill-carrying iteration time: {busy:.1f} ms total, "
+        f"{busy / sum(durs) * 100:.1f}% of all iteration time"
+    )
+    print(
+        f"  median KV usage during prefill iters: "
+        f"{pct([k for k, c in zip(kv, ctx, strict=True) if c > 0] or kv, 0.5):.1f}%"
+    )
+    if pct([k for k, c in zip(kv, ctx, strict=True) if c > 0] or kv, 0.5) > 85.0:
+        print("  VERDICT: prefill iterations run near the KV watermark -> the")
+        print("    engine is saturated while admitting prefill; holding there")
+        print("    converts directly into queueing delay.")
+    else:
+        print("  VERDICT: KV headroom exists during prefill iterations; the")
+        print("    engine is not KV-saturated, so hold cost is TTFT-only.")
+
+
+def q5_steps(step, iterations=None):
     """E4/E5: price c0 and check saturation."""
     section("E4/E5  Step pricing (c0) and saturation")
+
+    if iterations:
+        _q5_from_iterations(iterations)
+        return {"source": "vllm_iterations", "n": len(iterations)}
+
     if not step:
         print("  no STEP_DIAG records. Steps are only recorded when the")
         print("  gate path runs with diagnostics on.")
@@ -493,8 +613,11 @@ def main():
         print("no input files matched", file=sys.stderr)
         return 2
     print(f"reading {len(files)} file(s)")
-    adm, step = load(files)
-    print(f"parsed {len(adm)} ADM_DIAG records, {len(step)} STEP_DIAG records")
+    adm, step, it = load(files)
+    print(
+        f"parsed {len(adm)} ADM_DIAG records, {len(step)} STEP_DIAG records, "
+        f"{len(it)} vLLM iterations"
+    )
     if not adm and not step:
         print("\nNo records found. Check that diagnostics were enabled:")
         print('  extra_config {"lmcache.mp.admit_diagnostics": true}')
@@ -506,7 +629,7 @@ def main():
     q2_serialization(adm)
     q3_rank_spread(adm)
     q4_reasons(adm)
-    q5_steps(step)
+    q5_steps(step, it)
 
     if args.csv and adm:
         # Standard
