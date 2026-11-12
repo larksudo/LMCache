@@ -51,9 +51,10 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
-# Flush the buffer after this many records, so a long run cannot grow it
-# without bound and a short run still emits on close().
-_FLUSH_EVERY = 256
+# Flush the buffer after this many records. Kept small so a short run (a smoke
+# test with a handful of requests) still emits its records before the process
+# exits; close()/shutdown() flush the remainder in any case.
+_FLUSH_EVERY = 32
 # Hard cap on buffered records; oldest are dropped when exceeded. This bounds
 # memory if the logger itself blocks.
 _MAX_BUFFER = 8192

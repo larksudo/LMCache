@@ -2624,6 +2624,17 @@ class LMCacheMPWorkerAdapter:
         on the closing request client, and a straggler in-flight cycle cannot
         re-register or flip the health event after unregistration.
         """
+        # Diagnostics are buffered and only flush when the batch fills, so a
+        # short run (fewer than flush_every records) would otherwise discard
+        # every per-request line at exit. Flush before tearing down.
+        diag = getattr(self, "_diag", None)
+        if diag is not None:
+            try:
+                diag.summary(tag="shutdown")
+                diag.flush()
+            except Exception:  # pragma: no cover - never block shutdown
+                logger.debug("ADM_DIAG shutdown flush failed", exc_info=True)
+
         with self._transfer_ctx_lock:
             self._shutdown_started = True
         if self._kv_event_subscription is not None:
