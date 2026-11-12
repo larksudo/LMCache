@@ -118,6 +118,27 @@ def pct(values, q):
     return s[idx]
 
 
+def _spread(values):
+    """Return (max-min)/median, or nan when the column is constant."""
+    if not values:
+        return float("nan")
+    med = statistics.median(values)
+    if med <= 0:
+        return float("nan")
+    return (max(values) - min(values)) / med
+
+
+def _can_rank(values, min_distinct=3):
+    """A rank correlation needs enough distinct values to mean anything.
+
+    A constant column (every request same hit size, as in the fixed-shape
+    benchmark) yields a perfectly flat rank vector, so Spearman is undefined.
+    Reporting a verdict from it is worse than reporting nothing: it looks like
+    evidence while carrying none.
+    """
+    return len(set(values)) >= min_distinct
+
+
 def describe(values):
     if not values:
         return "n=0"
@@ -179,6 +200,26 @@ def q1_hit_vs_tail(adm):
     print(f"  tail  range {min(tails)}..{max(tails)} tokens")
     print(f"  Spearman(d, hit ) = {rho_hit:+.3f}")
     print(f"  Spearman(d, tail) = {rho_tail:+.3f}")
+
+    # Validity gates. Without them a constant hit/tail column (the fixed-shape
+    # benchmark) or a tiny sample still produced a confident VERDICT.
+    need = []
+    if not _can_rank(hits):
+        need.append(f"hit is constant ({len(set(hits))} distinct value(s))")
+    if not _can_rank(tails):
+        need.append(f"tail is constant ({len(set(tails))} distinct value(s))")
+    if len(good) < 30:
+        need.append(f"only n={len(good)} records (<30)")
+    if need:
+        print("  CANNOT DECIDE:")
+        for n in need:
+            print(f"    - {n}")
+        if not _can_rank(hits) or not _can_rank(tails):
+            print("    E1 needs a workload where hit or tail actually varies;")
+            print("    a fixed prefix/suffix shape cannot answer this question.")
+        else:
+            print("    The columns do vary, but the sample is too small to rank.")
+        return {"rho_hit": rho_hit, "rho_tail": rho_tail, "decided": False}
     # The gate buckets on tail. Show the damage directly.
     by_bucket = defaultdict(list)
     for r in good:
@@ -229,6 +270,13 @@ def q2_serialization(adm):
     ys = [r["d_ms"] for r in good]
     rho = spearman(xs, ys)
     print(f"  Spearman(d, inflight) = {rho:+.3f}")
+    if len(set(xs)) < 3 or len(good) < 30:
+        print("  CANNOT DECIDE:")
+        print(f"    inflight has {len(set(xs))} distinct value(s), n={len(good)}")
+        print("    On TP1 the server has a single GPU client, so retrieve")
+        print("    concurrency is structurally ~1 and this question is")
+        print("    unanswerable. Measure it on TP8 with --max-gpu-workers 1/4/8.")
+        return {"rho_inflight": rho, "decided": False}
     if rho > 0.4:
         keys = sorted(by_inflight)
         if len(keys) >= 2:
@@ -320,7 +368,14 @@ def q4_reasons(adm):
         f"\n  total records={total}  held={held} ({100.0 * held / max(1, total):.1f}%)"
     )
     no_sib = cnt.get("NO_SIBLING", 0)
-    if total and no_sib / total > 0.4:
+    if total < 30:
+        print(
+            "  CANNOT CONCLUDE: only "
+            f"{total} records. Reason shares are descriptive only;"
+        )
+        print("    a cache that evicted mid-run also produces NO_SIBLING, so")
+        print("    check the server log for 'triggering eviction' first.")
+    elif total and no_sib / total > 0.4:
         print(f"  VERDICT: {100.0 * no_sib / total:.0f}% of releases were NO_SIBLING")
         print("    (nothing in flight to coalesce with). The gate cannot act:")
         print("    the opportunity does not exist at this arrival rate.")
@@ -361,6 +416,19 @@ def q5_steps(step):
     print(f"  step duration: {describe(durs)} ms")
     print(f"  admitted/step: {describe([float(a) for a in adm_counts])}")
 
+    # c0 needs the token volume as a covariate. STEP_DIAG records it as -1
+    # until the gate has scheduler-side visibility, and without it the
+    # admitted groups differ in prefill work as well as in admission count --
+    # so the difference between groups is not c0. Say so instead of printing
+    # a number that will be quoted.
+    have_prefill = any(_num(s.get("prefill_tok"), -1) >= 0 for s in good)
+    if not have_prefill:
+        print("  CANNOT ESTIMATE c0:")
+        print("    prefill_tok is -1 on every step (worker-side signal only).")
+        print("    Group means below confound admission count with token volume;")
+        print("    do not use the difference as c0. Needs scheduler-side")
+        print("    prefill/decode tokens (C2), or vLLM iteration_details.")
+
     # Group steps by how many requests they admitted: the delta between the
     # groups at similar token volume is c0.
     by_adm = defaultdict(list)
@@ -380,7 +448,10 @@ def q5_steps(step):
     if len(by_adm) >= 2 and base is not None:
         keys = sorted(by_adm)
         c0 = statistics.mean(by_adm[keys[-1]]) - base
-        print(f"\n  rough c0 estimate = {c0:.1f} ms per admission")
+        if not have_prefill:
+            print(f"\n  confounded admitted-group delta = {c0:.1f} ms (NOT c0)")
+        else:
+            print(f"\n  rough c0 estimate = {c0:.1f} ms per admission")
         print("    (confounded by token volume; fit dur ~ 1 + prefill_tokens")
         print("     + decode_reqs + admitted on STEP_DIAG records for a clean")
         print("     coefficient and CI)")
