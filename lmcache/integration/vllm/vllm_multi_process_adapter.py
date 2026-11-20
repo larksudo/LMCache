@@ -1890,6 +1890,7 @@ class LMCacheMPWorkerAdapter:
             request_configs=request_configs,
         )
         transfer_ctx = self._require_transfer_ctx("submitting retrieve requests")
+        submit_wall_ts = time.monotonic()
         future = transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -1916,6 +1917,7 @@ class LMCacheMPWorkerAdapter:
                 hit_tokens=max(0, op.end - op.start),
                 prompt_tokens=prompt_tokens,
                 bucket=_bucket_for(tail_tokens),
+                submit_wall_ts=submit_wall_ts,
             )
         if event is not None:
             self.retrieve_events[request_id] = event
@@ -2887,3 +2889,4 @@ class LMCacheMPWorkerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
+

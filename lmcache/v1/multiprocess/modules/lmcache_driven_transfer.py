@@ -963,6 +963,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             RuntimeError: If the backend does not support IPC event handles.
         """
         st = time.perf_counter()
+        st_mono = time.monotonic()
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -1163,9 +1164,13 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             tokens_retrieved = num_chunks * self._ctx.chunk_size
             ed = time.perf_counter()
             logger.info(
-                "Retrieved %d tokens in %.3f seconds",
+                "Retrieved %d tokens in %.3f seconds RETRIEVE_DIAG rid=%s "
+                "t_start=%.6f t_end=%.6f",
                 tokens_retrieved,
                 ed - st,
+                key.request_id,
+                st_mono,
+                time.monotonic(),
             )
 
         return (

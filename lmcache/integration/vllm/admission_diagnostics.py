@@ -87,6 +87,10 @@ class RetrieveRecord:
     prompt_tokens: int
     submit_ts: float
     complete_ts: float = 0.0
+    # Absolute monotonic timestamp captured by the worker right before the
+    # RPC is issued. Same-container processes share CLOCK_MONOTONIC, so this
+    # can be joined with the server-side RETRIEVE_DIAG line by request id.
+    submit_wall_ts: float = 0.0
     report_ts: float = 0.0
     reason: str = REASON_HELD
     bucket: int = -1
@@ -125,7 +129,8 @@ class RetrieveRecord:
             "d_ms={d:.1f} hold_ms={h:.1f} total_ms={t:.1f} reason={reason} "
             "bucket={bucket} ewma_ms={ewma:.1f} eta_ms={eta:.1f} "
             "deadline_left_ms={dl:.1f} inflight={inf} ready={rdy} "
-            "kv_free={kvf} waiting={w} running={run}"
+            "kv_free={kvf} waiting={w} running={run} "
+            "t_submit={tsub:.6f} t_complete={tcomp:.6f}"
         ).format(
             rid=self.request_id,
             rank=self.rank,
@@ -145,6 +150,8 @@ class RetrieveRecord:
             kvf=self.kv_free_blocks,
             w=self.num_waiting,
             run=self.num_running,
+            tsub=self.submit_wall_ts,
+            tcomp=self.complete_ts,
         )
 
 
@@ -261,6 +268,7 @@ class AdmissionDiagnostics:
         hit_tokens: int,
         prompt_tokens: int,
         bucket: int = -1,
+        submit_wall_ts: float = 0.0,
     ) -> None:
         """Open a record when a retrieve is submitted."""
         if not self._enabled:
@@ -274,6 +282,7 @@ class AdmissionDiagnostics:
                     hit_tokens=int(hit_tokens),
                     prompt_tokens=int(prompt_tokens),
                     submit_ts=time.monotonic(),
+                    submit_wall_ts=float(submit_wall_ts),
                     bucket=int(bucket),
                 )
         except Exception:  # pragma: no cover - diagnostics must never break
